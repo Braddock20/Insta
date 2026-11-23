@@ -18,7 +18,7 @@ account:
 
 browser:
   # false = show a real window (needs a display; the wrapper script handles that)
-  headless: false
+  headless: true
   slow_mo_ms: 35
   profile_dir: "state/profile"
   proxy: ""

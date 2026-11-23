@@ -206,25 +206,30 @@ def parse_cookie_source(text: str, default_domain: str = ".instagram.com") -> li
     ]
 
 
-def read_cookie_source(source: str) -> str:
-    """Resolve a cookie string from a file path, a literal string, or stdin.
 
-    ``-`` means read stdin, so the cookie never has to be written to disk.
-    """
+def read_cookie_source(source: str) -> str:
+    """Resolve cookies from a file path, literal string, or stdin."""
     source = (source or "").strip()
+
     if not source:
         return ""
+
     if source == "-":
         import sys
-
         return sys.stdin.read().strip()
 
-    path = Path(source).expanduser()
-    if path.exists() and path.is_file():
-        return path.read_text(encoding="utf-8").strip()
+    # First check whether the value is an existing file.
+    # Long cookie headers can raise OSError when treated as paths.
+    try:
+        path = Path(source).expanduser()
+        if path.is_file():
+            return path.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        pass
 
-    # Not a path — treat the value itself as the cookie header.
+    # Otherwise, treat it as a literal cookie header.
     return source
+
 
 
 class SessionExpired(RuntimeError):

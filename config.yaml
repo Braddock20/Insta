@@ -131,7 +131,7 @@ publishing:
 # Actions:  follow_back | follow | unfollow | like_post | like_comment |
 #           reply_dm | reply_story
 automations:
-  enabled: false
+  enabled: true
 
   rules:
     # Follow back the people who follow you.

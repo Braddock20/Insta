@@ -549,30 +549,33 @@ class CommandRouter:
         @self.register("storiesall", "pull story tray and like every active story")
         def _storiesall(args, thread):
             # Baileys-style: one tray pull → like everything active. No following walk.
-            if hasattr(self.client, "like_tray_stories"):
-                liked, accounts = self.client.like_tray_stories()
+            like_fn = getattr(self.client, "like_tray_stories", None)
+            if callable(like_fn):
+                liked, accounts = like_fn()
                 return f"✅ liked {liked} stories from {accounts} accounts (tray)"
-            # Fallback
-            tray = self.client.stories_tray(fill_items=True) if hasattr(self.client, "stories_tray") else {}
+            tray_fn = getattr(self.client, "stories_tray", None)
+            tray = tray_fn(fill_items=True) if callable(tray_fn) else {}
             total = 0
-            for uname, stories in tray.items():
+            for uname, stories in (tray or {}).items():
                 for story in stories:
-                    if story.pk and self.client.like_story(story.pk):
+                    if getattr(story, "pk", None) and self.client.like_story(story.pk):
                         total += 1
-            return f"✅ liked {total} stories from {len(tray)} accounts (tray)"
+            return f"✅ liked {total} stories from {len(tray or {})} accounts (tray)"
 
         @self.register("viewall", "pull story tray and mark every active story seen")
         def _viewall(args, thread):
             # Baileys-style: one tray pull → mark all seen.
-            if hasattr(self.client, "view_tray_stories"):
-                viewed, accounts = self.client.view_tray_stories()
+            view_fn = getattr(self.client, "view_tray_stories", None)
+            if callable(view_fn):
+                viewed, accounts = view_fn()
                 return f"✅ viewed {viewed} stories from {accounts} accounts (tray)"
-            tray = self.client.stories_tray(fill_items=True) if hasattr(self.client, "stories_tray") else {}
-            all_pks = [s.pk for stories in tray.values() for s in stories if s.pk]
+            tray_fn = getattr(self.client, "stories_tray", None)
+            tray = tray_fn(fill_items=True) if callable(tray_fn) else {}
+            all_pks = [s.pk for stories in (tray or {}).values() for s in stories if getattr(s, "pk", None)]
             if all_pks:
                 self.client.view_stories(all_pks)
             return (
-                f"✅ viewed {len(all_pks)} stories from {len(tray)} accounts (tray)"
+                f"✅ viewed {len(all_pks)} stories from {len(tray or {})} accounts (tray)"
                 if all_pks
                 else "no active stories right now"
             )

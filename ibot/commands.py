@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import shlex
 import time
-from typing import Callable
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable
 
 from . import log
 from .client.base import Thread
@@ -101,6 +102,82 @@ class CommandRouter:
             return f"❌ /{name} failed: {type(exc).__name__}: {exc}"
 
     # ------------------------------------------------------------ utilities
+    @property
+    def scanner(self):
+        """The scanner — the thing that reads the whole follower list."""
+        scanner = getattr(self, "_scanner", None)
+        if scanner is None:
+            from .bulk import Scanner
+
+            scanner = Scanner(self.client, self.store, self.cfg)
+            self._scanner = scanner
+        return scanner
+
+    def _parallel(self, items: list, fn: Callable[[Any], Any], workers: int | None = None) -> list:
+        """Run ``fn`` over ``items`` at the same time. The order is kept.
+
+        This is what makes the bot feel quick: reading a hundred accounts'
+        stories one after the other takes a minute; reading them at the same
+        time takes a second.
+        """
+        if workers is None:
+            workers = int(self.cfg.get("speed.commands_parallel", 8) or 8)
+        workers = max(1, min(int(workers), 32))
+        if workers == 1 or len(items) <= 1:
+            return [fn(item) for item in items]
+
+        def guarded(item):
+            try:
+                return fn(item)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("parallel task failed: %s", exc)
+                return None
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(guarded, items))
+
+    def _limit(self, args: list[str], default: int = 0) -> int:
+        """How many of something. 0 means *all of them*."""
+        for arg in args:
+            text = arg.lower()
+            if text in ("all", "every", "*"):
+                return 0
+            if text.isdigit():
+                return int(text)
+        return default
+
+    def _graph(self, flag: str) -> list[dict]:
+        """The connections graph from the database.
+
+        A scan runs first when the graph is empty, so the very first question
+        already has an answer.
+        """
+        if self.store is None:
+            raise CommandError("no store attached")
+        rows = self.store.connections(flag)
+        if rows:
+            return rows
+        try:
+            self.scanner.scan()
+        except Exception as exc:  # noqa: BLE001
+            raise CommandError(f"the scan failed: {exc}") from exc
+        return self.store.connections(flag)
+
+    def _allowed(self, kind: str, target: str) -> bool:
+        """Is this visible action allowed right now?
+
+        The guardrails hold the caps — how many likes a day, how many
+        follows, how many story views. Every visible action goes through
+        them, so no command can push the account past the budget.
+        """
+        if self.guardrails is None:
+            return True
+        decision = self.guardrails.check_action(kind, target=target)
+        if not decision.allowed:
+            log.info("skipped %s on %s: %s", kind, target, decision.reason)
+            return False
+        return True
+
     def _autoflag(self, name: str, default: bool = False) -> bool:
         if self.store is None:
             return default
@@ -129,6 +206,7 @@ class CommandRouter:
         self._register_inbox()
         self._register_content()
         self._register_people()
+        self._register_graph()
         self._register_notes()
         self._register_automation()
         self._register_ops()
@@ -141,12 +219,13 @@ class CommandRouter:
         @self.register("help", "show this list")
         def _help(args, thread):
             groups = [
-                ("Basics", ["help", "whoami", "status", "health", "relogin", "ping", "uptime", "about", "version"]),
+                ("Basics", ["help", "whoami", "status", "health", "relogin", "ping", "uptime", "about", "version", "engine"]),
                 ("Inbox", ["inbox", "threads", "unread", "last", "requests", "accept", "reply", "send", "react", "clear", "dms", "dmsearch"]),
-                ("Stories", ["stories", "storyview", "storylike", "storyreply", "viewers", "highlights"]),
+                ("Stories", ["stories", "storyview", "storylike", "storiesall", "viewall", "storyreply", "viewers", "highlights"]),
                 ("Posts", ["post", "like", "unlike", "comments", "comment", "feed", "reels"]),
                 ("People", ["profile", "follow", "unfollow", "followers", "following", "followback", "mutuals", "search"]),
-                ("Notes", ["notes", "note"]),
+                ("The graph", ["scan", "nonfollowers", "fans", "unfollowers"]),
+                ("Notes", ["notes", "note", "notelike"]),
                 ("Moderation", ["block", "unblock", "muteposts", "unmuteposts", "mutestories", "unmutestories", "archive", "mute", "unmute", "followrequests", "approve", "decline"]),
                 ("Publishing", ["postphoto", "postvideo", "storypost"]),
                 ("Automation", ["auto", "autolike", "autoview", "autostory", "autofollow", "autocomment", "autonote", "autowelcome", "autostorypost"]),
@@ -338,13 +417,13 @@ class CommandRouter:
                     return f"@{user} has no stories right now"
                 return "\n".join(f"story {s.pk} ({s.item_type})" for s in stories)
             me = self.client.whoami()
-            following = self.client.following(me.username, amount=25)
+            following = self.client.connections("following", me.username, 0)
+            found = self._parallel(following, lambda p: (p, self.client.stories(p.username)))
             lines = []
-            for person in following:
-                try:
-                    stories = self.client.stories(person.username)
-                except Exception:  # noqa: BLE001
+            for item in found:
+                if not item:
                     continue
+                person, stories = item
                 if stories:
                     lines.append(f"@{person.username}: {len(stories)} story")
             return "\n".join(lines) or "nobody you follow has a story right now"
@@ -358,14 +437,71 @@ class CommandRouter:
             ok = self.client.view_stories([s.pk for s in stories])
             return f"✅ viewed {len(stories)} stories from @{user}" if ok else "❌ could not mark them seen"
 
-        @self.register("storylike", "like a story: /storylike [user]")
+        @self.register("storylike", "like every story of an account: /storylike [user]")
         def _storylike(args, thread):
             user = self._target_user(args) if args else self.client.whoami().username
             stories = self.client.stories(user)
             if not stories:
                 return f"@{user} has no stories"
-            ok = self.client.like_story(stories[0].pk)
-            return f"✅ liked @{user}'s story" if ok else "❌ the like was refused"
+            liked = 0
+            for story in stories:
+                if self._allowed("story_like", user):
+                    if self.client.like_story(story.pk):
+                        liked += 1
+                        if self.guardrails is not None:
+                            self.guardrails.record_action("story_like", target=user, detail=story.pk)
+                else:
+                    break
+            return f"✅ liked {liked} of {len(stories)} stories from @{user}"
+
+        @self.register("storiesall", "like the stories of everybody you follow")
+        def _storiesall(args, thread):
+            me = self.client.whoami()
+            people = self.client.connections("following", me.username, 0)
+            found = self._parallel(people, lambda p: (p, self.client.stories(p.username)))
+            total = 0
+            lines = []
+            for item in found:
+                if not item:
+                    continue
+                person, stories = item
+                if not stories:
+                    continue
+                liked = 0
+                for story in stories:
+                    if self._allowed("story_like", person.username):
+                        if self.client.like_story(story.pk):
+                            liked += 1
+                            if self.guardrails is not None:
+                                self.guardrails.record_action(
+                                    "story_like", target=person.username, detail=story.pk
+                                )
+                    else:
+                        break
+                if liked:
+                    total += liked
+                    lines.append(f"@{person.username}: {liked}")
+            return f"✅ liked {total} stories\n" + "\n".join(lines[:40])
+
+        @self.register("viewall", "view the stories of everybody you follow")
+        def _viewall(args, thread):
+            me = self.client.whoami()
+            people = self.client.connections("following", me.username, 0)
+            found = self._parallel(people, lambda p: (p, self.client.stories(p.username)))
+            total = 0
+            for item in found:
+                if not item:
+                    continue
+                person, stories = item
+                if not stories:
+                    continue
+                if self.client.view_stories([s.pk for s in stories]):
+                    total += len(stories)
+                    if self.guardrails is not None:
+                        self.guardrails.record_action(
+                            "story_view", target=person.username, detail=f"{len(stories)} stories"
+                        )
+            return f"✅ viewed {total} stories from {len(people)} accounts"
 
         @self.register("storyreply", "reply to a story as a DM: /storyreply <user> <text>")
         def _storyreply(args, thread):
@@ -457,27 +593,63 @@ class CommandRouter:
             ok = self.client.unfollow(user)
             return f"✅ unfollowed @{user}" if ok else f"❌ could not unfollow @{user}"
 
-        @self.register("followers", "list followers: /followers [user]")
+        @self.register("followers", "every follower: /followers [user] [n|all]")
         def _followers(args, thread):
             user = args[0].lstrip("@") if args else self.client.whoami().username
-            people = self.client.followers(user, amount=30)
+            limit = self._limit(args[1:])
+            people = self.client.connections("followers", user, limit)
             if not people:
                 return "no followers to show"
-            return "\n".join(f"@{p.username}" for p in people)
+            path = self._dump("followers", user, people)
+            lines = [f"{len(people)} followers of @{user}:"]
+            lines += [f"@{p.username}" for p in people[:60]]
+            if len(people) > 60:
+                lines.append(f"… and {len(people) - 60} more — the whole list is in {path}")
+            return "\n".join(lines)
 
-        @self.register("following", "list who you follow: /following [user]")
+        @self.register("following", "everyone you follow: /following [user] [n|all]")
         def _following(args, thread):
             user = args[0].lstrip("@") if args else self.client.whoami().username
-            people = self.client.following(user, amount=30)
+            limit = self._limit(args[1:])
+            people = self.client.connections("following", user, limit)
             if not people:
                 return "not following anyone"
-            return "\n".join(f"@{p.username}" for p in people)
+            path = self._dump("following", user, people)
+            lines = [f"{len(people)} accounts @{user} follows:"]
+            lines += [f"@{p.username}" for p in people[:60]]
+            if len(people) > 60:
+                lines.append(f"… and {len(people) - 60} more — the whole list is in {path}")
+            return "\n".join(lines)
+
+        def _dump(kind: str, user: str, people: list) -> str:
+            """Keep the whole list on disk — a DM cannot hold 50,000 names."""
+            try:
+                from .bulk import write_jsonl
+
+                folder = self.scanner.folder()
+                path = folder / f"{kind}-{user}.jsonl"
+                write_jsonl(
+                    path,
+                    [
+                        {
+                            "pk": p.user_id,
+                            "username": p.username,
+                            "full_name": p.full_name,
+                            "is_private": p.is_private,
+                            "is_verified": p.is_verified,
+                        }
+                        for p in people
+                    ],
+                )
+                return str(path)
+            except Exception:  # noqa: BLE001
+                return "the state folder"
 
         @self.register("followback", "follow the people who followed you")
         def _followback(args, thread):
             me = self.client.whoami()
-            followers = {p.username for p in self.client.followers(me.username, amount=50)}
-            following = {p.username for p in self.client.following(me.username, amount=50)}
+            followers = {p.username for p in self.client.connections("followers", me.username, 0)}
+            following = {p.username for p in self.client.connections("following", me.username, 0)}
             targets = sorted(followers - following)
             if not targets:
                 return "nobody new to follow back"
@@ -495,16 +667,173 @@ class CommandRouter:
                 return "nothing new to follow back (the daily cap may be reached)"
             return "✅ followed back: " + ", ".join(f"@{n}" for n in done)
 
+    # ----------------------------------------------------------- the graph
+    def _register_graph(self) -> None:
+        """The commands that read the whole account, not just the first page."""
+
+        @self.register("scan", "read every follower and following: /scan")
+        def _scan(args, thread):
+            summary = self.scanner.scan(kinds=("followers", "following"))
+            lists = summary.get("lists", {})
+            parts = []
+            for kind, result in lists.items():
+                mark = "✅" if result.get("ok") else "❌"
+                parts.append(
+                    f"{mark} {kind}: {result.get('count', 0)} in {result.get('elapsed_ms', 0)} ms"
+                )
+            lines = ["the picture is taken:", *parts]
+            if "diff" in summary:
+                lines.append(
+                    f"non-followers: {summary.get('nonfollowers', 0)} · "
+                    f"mutuals: {summary.get('mutuals', 0)} · "
+                    f"fans: {summary.get('fans', 0)}"
+                )
+            lines.append(f"engine: {summary.get('engine')} · {summary.get('elapsed_ms', 0)} ms")
+            lines.append(f"kept in: {summary.get('folder')}")
+            return "\n".join(lines)
+
+        @self.register("nonfollowers", "the people you follow that do not follow back")
+        def _nonfollowers(args, thread):
+            rows = self._graph("nonfollowers")
+            if not rows:
+                return "everyone you follow follows you back"
+            limit = self._limit(args[1:]) or 40
+            lines = [f"{len(rows)} people you follow do not follow you back:"]
+            for row in rows[:limit]:
+                lines.append(f"@{row.get('username') or row.get('pk')}")
+            if len(rows) > limit:
+                lines.append(f"… and {len(rows) - limit} more")
+            lines.append("/unfollowers removes them")
+            return "\n".join(lines)
+
+        @self.register("fans", "the people who follow you that you do not follow back")
+        def _fans(args, thread):
+            rows = self._graph("fans")
+            if not rows:
+                return "you follow everybody who follows you"
+            limit = self._limit(args[1:]) or 40
+            lines = [f"{len(rows)} people follow you but you do not follow back:"]
+            for row in rows[:limit]:
+                lines.append(f"@{row.get('username') or row.get('pk')}")
+            if len(rows) > limit:
+                lines.append(f"… and {len(rows) - limit} more")
+            return "\n".join(lines)
+
+        @self.register("unfollowers", "unfollow the people who do not follow back")
+        def _unfollowers(args, thread):
+            """Remove the non-followers.
+
+            A rehearsal comes first — the plan is printed, nothing is touched.
+            ``yes`` is what actually does it.
+            """
+            rows = self._graph("nonfollowers")
+            if not rows:
+                return "there is nobody to remove"
+
+            limit = self._limit(args[:1], default=int(self.cfg.get("unfollow.limit", 0) or 0))
+            confirm = any(a.lower() in ("yes", "y", "do", "go") for a in args[1:])
+            whitelist = {
+                name.strip().lstrip("@").lower()
+                for name in str(self.cfg.get("unfollow.whitelist", "") or "").split(",")
+                if name.strip()
+            }
+            skip_verified = bool(self.cfg.get("unfollow.skip_verified", False))
+            skip_private = bool(self.cfg.get("unfollow.skip_private", False))
+
+            targets = []
+            for row in rows:
+                name = str(row.get("username") or "")
+                if not name or name.lower() in whitelist:
+                    continue
+                if skip_verified and row.get("is_verified"):
+                    continue
+                if skip_private and row.get("is_private"):
+                    continue
+                targets.append(row)
+                if limit and len(targets) >= limit:
+                    break
+
+            if not targets:
+                return "everybody on the list is on the whitelist"
+
+            if not confirm:
+                lines = [
+                    f"🧪 rehearsal — {len(targets)} account(s) would be unfollowed:",
+                    *[f"@{row.get('username') or row.get('pk')}" for row in targets[:40]],
+                ]
+                if len(targets) > 40:
+                    lines.append(f"… and {len(targets) - 40} more")
+                lines.append("send /unfollowers yes to do it for real")
+                return "\n".join(lines)
+
+            gap_min = float(self.cfg.get("unfollow.gap_min", 20) or 0)
+            gap_max = float(self.cfg.get("unfollow.gap_max", 60) or 0)
+            if gap_max < gap_min:
+                gap_max = gap_min
+            done: list[str] = []
+            failed: list[str] = []
+            for row in targets:
+                name = str(row.get("username") or "")
+                pk = str(row.get("pk") or "")
+                if self.guardrails is not None:
+                    decision = self.guardrails.check_action("unfollow", target=name)
+                    if not decision.allowed:
+                        failed.append(f"@{name} ({decision.reason})")
+                        continue
+                ok = self.client.unfollow_by_id(pk, name)
+                if ok:
+                    done.append(name)
+                    if self.guardrails is not None:
+                        self.guardrails.record_action("unfollow", target=name, detail="non-follower")
+                    if self.store is not None:
+                        self.store.record_action("unfollow", target=name, detail="non-follower")
+                else:
+                    failed.append(f"@{name} (refused)")
+                if gap_max:
+                    time.sleep(gap_min + (time.time() % max(0.001, gap_max - gap_min)))
+            lines = [f"✅ unfollowed {len(done)} account(s)"]
+            if failed:
+                lines.append(f"⚠️  {len(failed)} skipped: " + ", ".join(failed[:10]))
+            return "\n".join(lines)
+
+        @self.register("engine", "which engine is working and how fast it is")
+        def _engine(args, thread):
+            engine = self.scanner.engine
+            binary = engine.binary()
+            lines = [
+                f"engine    : {engine.engine()}",
+                f"binary    : {binary or 'not built — Python is doing the work'}",
+                f"page size : {self.cfg.get('speed.page_size', 200)}",
+                f"parallel  : {self.cfg.get('speed.commands_parallel', 8)} at a time",
+                f"turbo     : {'on' if self.cfg.get('speed.turbo', True) else 'off'}",
+            ]
+            if self.store is not None:
+                last = self.store.last_scan()
+                if last:
+                    lines.append(
+                        f"last scan : {last.get('kind')} · {last.get('count')} · "
+                        f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(last.get('ts') or 0))}"
+                    )
+                counts = self.store.connection_counts()
+                lines.append(
+                    f"graph     : {counts['followers']} followers · "
+                    f"{counts['following']} following"
+                )
+            return "\n".join(lines)
+
     # ---------------------------------------------------------------- notes
     def _register_notes(self) -> None:
-        @self.register("notes", "the notes in your inbox")
+        @self.register("notes", "every note in your inbox")
         def _notes(args, thread):
             notes = self.client.notes()
             if not notes:
                 return "no notes right now"
-            return "\n".join(
-                f"@{n.username}: {self._short(n.text, 90)}" for n in notes[:15] if n.text
-            ) or "no notes with text right now"
+            with_text = [n for n in notes if n.text]
+            lines = [f"{len(notes)} notes ({len(with_text)} with text):"]
+            lines += [f"@{n.username}: {self._short(n.text, 90)}" for n in with_text[:40]]
+            if len(with_text) > 40:
+                lines.append(f"… and {len(with_text) - 40} more")
+            return "\n".join(lines)
 
         @self.register("note", "one person's note: /note @user")
         def _note(args, thread):
@@ -513,6 +842,56 @@ class CommandRouter:
                 if n.username.lower() == user.lower():
                     return f"@{n.username}: {n.text}"
             return f"@{user} has no note right now"
+
+        @self.register("notelike", "like every note in the inbox")
+        def _notelike(args, thread):
+            """Put a heart on every note that is there.
+
+            Instagram never built a like button for notes. What it did build
+            is a reaction on the message itself, and that is what the bot
+            uses — a heart on the note, sent the same way you would send it
+            by hand.
+            """
+            notes = self.client.notes()
+            if not notes:
+                return "no notes right now"
+            liked = 0
+            missed: list[str] = []
+            for note in notes:
+                if not note.text:
+                    continue
+                if self._allowed("like", note.username):
+                    if self._like_note(note):
+                        liked += 1
+                        if self.guardrails is not None:
+                            self.guardrails.record_action("like", target=note.username, detail="note")
+                    else:
+                        missed.append(f"@{note.username}")
+                else:
+                    break
+            lines = [f"✅ liked {liked} of {len(notes)} notes"]
+            if missed:
+                lines.append("Instagram refused: " + ", ".join(missed[:10]))
+            return "\n".join(lines)
+
+        def _like_note(self, note) -> bool:
+            """Like one note — a reaction on the message, or the story endpoint."""
+            thread_id = str(getattr(note, "thread_id", "") or "")
+            message_id = str(getattr(note, "id", "") or "")
+            if thread_id and message_id:
+                try:
+                    if self.client.react(thread_id, message_id, "❤️"):
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+            media_id = str(getattr(note, "media_id", "") or "")
+            if media_id:
+                try:
+                    if self.client.like_story(media_id):
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+            return False
 
     # ------------------------------------------------------------ automation
     def _register_automation(self) -> None:
@@ -806,11 +1185,16 @@ class CommandRouter:
 
         @self.register("mutuals", "who follows you and you follow back")
         def _mutuals(args, thread):
-            me = self.client.whoami()
-            followers = {p.username for p in self.client.followers(me.username, amount=100)}
-            following = {p.username for p in self.client.following(me.username, amount=100)}
-            both = sorted(followers & following)
-            return "\n".join(f"@{n}" for n in both) or "no mutual followers"
+            rows = self._graph("mutuals")
+            if not rows:
+                return "no mutual followers"
+            limit = self._limit(args[1:]) or 40
+            lines = [f"{len(rows)} people follow you and you follow back:"]
+            for row in rows[:limit]:
+                lines.append(f"@{row.get('username') or row.get('pk')}")
+            if len(rows) > limit:
+                lines.append(f"… and {len(rows) - limit} more")
+            return "\n".join(lines)
 
         @self.register("reels", "the reels of an account: /reels [user]")
         def _reels(args, thread):

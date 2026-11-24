@@ -241,11 +241,74 @@ class BaseClient:
     def unfollow(self, username: str) -> bool:
         raise NotImplementedError
 
-    # --------------------------------------------------------------- notes
+    # ------------------------------------------------------------- notes
     def notes(self) -> list[Note]:
         raise NotImplementedError
 
     def create_note(self, text: str) -> Note | None:
+        raise NotImplementedError
+
+    # --------------------------------------------------------- moderation
+    def block(self, username: str) -> bool:
+        raise NotImplementedError
+
+    def unblock(self, username: str) -> bool:
+        raise NotImplementedError
+
+    def mute_posts(self, username: str) -> bool:
+        raise NotImplementedError
+
+    def unmute_posts(self, username: str) -> bool:
+        raise NotImplementedError
+
+    def mute_stories(self, username: str) -> bool:
+        raise NotImplementedError
+
+    def unmute_stories(self, username: str) -> bool:
+        raise NotImplementedError
+
+    def archive_thread(self, thread_id: str) -> bool:
+        raise NotImplementedError
+
+    def mute_thread(self, thread_id: str) -> bool:
+        raise NotImplementedError
+
+    def unmute_thread(self, thread_id: str) -> bool:
+        raise NotImplementedError
+
+    def follow_requests(self, amount: int = 20) -> list[Profile]:
+        raise NotImplementedError
+
+    def approve_follow_request(self, username: str) -> bool:
+        raise NotImplementedError
+
+    def decline_follow_request(self, username: str) -> bool:
+        raise NotImplementedError
+
+    # -------------------------------------------------------------- extras
+    def highlights(self, username: str) -> list[dict]:
+        raise NotImplementedError
+
+    def story_viewers(self, story_pk: str) -> list[Profile]:
+        raise NotImplementedError
+
+    def insights(self) -> dict:
+        raise NotImplementedError
+
+    def reels(self, username: str, amount: int = 10) -> list[Media]:
+        raise NotImplementedError
+
+    def thread_messages(self, thread_id: str, amount: int = 20) -> list[Message]:
+        raise NotImplementedError
+
+    # ---------------------------------------------------------- publishing
+    def publish_photo(self, path: str, caption: str = "") -> Media | None:
+        raise NotImplementedError
+
+    def publish_video(self, path: str, caption: str = "") -> Media | None:
+        raise NotImplementedError
+
+    def publish_story(self, path: str, caption: str = "") -> str:
         raise NotImplementedError
 
     # -------------------------------------------------------------- status

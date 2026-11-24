@@ -375,19 +375,41 @@ class ApiClient(BaseClient):
         need_fetch: list[tuple[str, str]] = []  # (uid, username)
         try:
             raw = None
-            if hasattr(self.cl, "reels_tray"):
+            # Only call if it's actually a callable — never treat a string attr as a method
+            reels_fn = getattr(self.cl, "reels_tray", None)
+            if callable(reels_fn):
                 try:
-                    raw = self._call(self.cl.reels_tray)
-                except Exception:
+                    raw = self._call(reels_fn)
+                except Exception as exc:
+                    log.debug("reels_tray() failed: %s", exc)
                     raw = None
-            if raw is None and hasattr(self.cl, "private_request"):
-                raw = self._call(self.cl.private_request, "feed/reels_tray/")
+            if raw is None:
+                priv = getattr(self.cl, "private_request", None)
+                if callable(priv):
+                    try:
+                        raw = self._call(priv, "feed/reels_tray/")
+                    except Exception as exc:
+                        log.debug("private_request feed/reels_tray/ failed: %s", exc)
+                        raw = None
             if not raw:
                 return found
 
-            tray = raw.get("tray") if isinstance(raw, dict) else getattr(raw, "tray", None)
+            if isinstance(raw, dict):
+                tray = raw.get("tray")
+            else:
+                tray = getattr(raw, "tray", None)
             if not tray:
                 return found
+
+            my_id = str(getattr(self, "_own_user_id", "") or "")
+            try:
+                own = getattr(self, "own_user_id", None)
+                if callable(own):
+                    my_id = str(own() or my_id)
+                elif own is not None:
+                    my_id = str(own or my_id)
+            except Exception:
+                pass
 
             for item in tray:
                 if isinstance(item, dict):
@@ -395,8 +417,6 @@ class ApiClient(BaseClient):
                     uname = str(user.get("username") or "")
                     uid = str(user.get("pk") or user.get("id") or item.get("id") or "")
                     items = item.get("items") or []
-                    media_count = int(item.get("media_count") or 0)
-                    media_ids = item.get("media_ids") or []
                 else:
                     user = getattr(item, "user", None)
                     uname = str(getattr(user, "username", "") or "") if user else ""
@@ -406,13 +426,10 @@ class ApiClient(BaseClient):
                         or ""
                     )
                     items = getattr(item, "items", None) or []
-                    media_count = int(getattr(item, "media_count", 0) or 0)
-                    media_ids = getattr(item, "media_ids", None) or []
 
                 if not uid and not uname:
                     continue
-                # Skip self
-                if uid and uid == self.own_user_id():
+                if my_id and uid and str(uid) == my_id:
                     continue
 
                 if items:
@@ -420,11 +437,9 @@ class ApiClient(BaseClient):
                     stories = [s for s in stories if s.pk]
                     if stories:
                         found[uname or uid] = stories
-                elif fill_items and (media_count > 0 or media_ids or True):
-                    # Tray listed them as having stories but omitted items
+                elif fill_items:
                     need_fetch.append((uid, uname))
 
-            # Fill missing items — only for accounts the tray said have stories
             if need_fetch:
                 def _fetch(pair):
                     uid, uname = pair
@@ -441,6 +456,9 @@ class ApiClient(BaseClient):
             return found
         except InstagramError as exc:
             log.warning("reels_tray failed: %s", exc)
+            return found
+        except TypeError as exc:
+            log.warning("reels_tray type error: %s", exc)
             return found
 
     def like_tray_stories(self) -> tuple[int, int]:
@@ -537,17 +555,22 @@ class ApiClient(BaseClient):
                 continue
         if not pks:
             return False
+        seen_fn = getattr(self.cl, "story_seen", None)
+        if not callable(seen_fn):
+            return False
         try:
-            # story_seen accepts a list — one request for many stories
-            self._call(self.cl.story_seen, pks)
+            self._call(seen_fn, pks)
             return True
-        except InstagramError:
+        except (InstagramError, TypeError):
             return False
 
     def like_story(self, story_pk: str) -> bool:
+        like_fn = getattr(self.cl, "story_like", None)
+        if not callable(like_fn):
+            return False
         try:
-            return bool(self._call(self.cl.story_like, str(story_pk)))
-        except InstagramError:
+            return bool(self._call(like_fn, str(story_pk)))
+        except (InstagramError, TypeError):
             return False
 
     def media(self, reference: str) -> Media:

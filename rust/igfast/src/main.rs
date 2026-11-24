@@ -206,9 +206,49 @@ impl Engine {
 
     fn get_json(&self, url: &str) -> Result<Value, String> {
         let req = self.with_headers(self.agent.get(url));
-        let resp = req.call().map_err(|e| format!("{e}"))?;
-        let text = resp.into_string().map_err(|e| format!("{e}"))?;
-        serde_json::from_str(&text).map_err(|e| format!("bad json: {e}"))
+        let text = match req.call() {
+            Ok(resp) => resp.into_string().map_err(|e| format!("{e}"))?,
+            Err(ureq::Error::Status(code, resp)) => {
+                // Instagram says "no" and puts the reason in the body.
+                let body = resp.into_string().unwrap_or_default();
+                return Err(format!("HTTP {code}: {}", Self::failure(&body)));
+            }
+            Err(e) => return Err(format!("{e}")),
+        };
+        let value = serde_json::from_str(&text).map_err(|e| format!("bad json: {e}"))?;
+        Self::check(&value)?;
+        Ok(value)
+    }
+
+    /// The reason Instagram refused, in words.
+    fn failure(body: &str) -> String {
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            if let Err(detail) = Self::check(&value) {
+                return detail;
+            }
+        }
+        let trimmed: String = body.chars().take(160).collect();
+        if trimmed.trim().is_empty() {
+            "the request was refused".to_string()
+        } else {
+            trimmed
+        }
+    }
+
+    /// A refused answer looks exactly like an empty list unless it is read
+    /// properly: Instagram answers with `{"status": "fail"}` more often than
+    /// with an error code. `check` turns that into an error instead of a
+    /// cheerful zero.
+    fn check(value: &Value) -> Result<(), String> {
+        if value.get("status").and_then(|s| s.as_str()) == Some("fail") {
+            let title = value.get("error_title").and_then(|s| s.as_str()).unwrap_or("");
+            let message = value
+                .get("message")
+                .and_then(|s| s.as_str())
+                .unwrap_or("the request was refused");
+            return Err(format!("{title} {message}").trim().to_string());
+        }
+        Ok(())
     }
 
     fn post_form(&self, url: &str, body: &str) -> Result<Value, String> {
@@ -294,6 +334,16 @@ fn walk(
             .and_then(|u| u.as_array())
             .cloned()
             .unwrap_or_default();
+        if body.get("users").is_none() {
+            // A refused answer has no "users" in it. Say so, instead of
+            // handing back an empty list that looks like the truth.
+            let reason = body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("the answer had no users in it");
+            errors.lock().unwrap().push(format!("page {pages}: {reason}"));
+            break;
+        }
         if users.is_empty() && pages > 0 {
             break;
         }
@@ -616,8 +666,10 @@ fn single_list(
         &seen,
     );
     let users = seen.lock().unwrap().len();
+    let errors = errors.lock().unwrap().clone();
+    let ok = errors.is_empty();
     Ok(json!({
-        "ok": true,
+        "ok": ok,
         "engine": "rust",
         "kind": kind,
         "user_id": uid,
@@ -625,7 +677,8 @@ fn single_list(
         "pages": pages,
         "written": written,
         "out": req.out,
-        "errors": errors.lock().unwrap().clone(),
+        "error": errors.first().cloned().unwrap_or_default(),
+        "errors": errors,
         "elapsed_ms": started.elapsed().as_millis() as u64,
     }))
 }
@@ -719,14 +772,23 @@ fn many_lists(
         }
     });
 
+    // Every lock is taken once, and the values are read out before the
+    // answer is built. Locking the same mutex twice in one statement would
+    // deadlock it.
+    let found = seen.lock().unwrap().len();
+    let error_list = errors.lock().unwrap().clone();
+    let ok = error_list.is_empty();
+    let first_error = error_list.first().cloned().unwrap_or_default();
+
     Ok(json!({
-        "ok": true,
+        "ok": ok,
         "engine": "rust",
-        "count": seen.lock().unwrap().len(),
+        "count": found,
         "accounts": done.load(Ordering::Relaxed),
         "pages": pages_done.load(Ordering::Relaxed),
         "out": req.out,
-        "errors": errors.lock().unwrap().clone(),
+        "error": first_error,
+        "errors": error_list,
         "elapsed_ms": started.elapsed().as_millis() as u64,
     }))
 }

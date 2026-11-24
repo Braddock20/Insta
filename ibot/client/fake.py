@@ -54,6 +54,12 @@ class FakeClient(BaseClient):
         self.sent: list[tuple[str, str]] = []
         self.liked: list[str] = []
         self.followed: list[str] = []
+        self.blocked: list[str] = []
+        self.muted: list[str] = []
+        self.archived: list[str] = []
+        self.approved: list[str] = []
+        self.declined: list[str] = []
+        self.published: list[tuple[str, str, str]] = []
         self.fail_next: Exception | None = None
 
     # -------------------------------------------------------------- helpers
@@ -274,6 +280,82 @@ class FakeClient(BaseClient):
 
     def create_note(self, text: str) -> Note | None:
         return self.add_note(self.own_username, text)
+
+    # --------------------------------------------------------- moderation
+    def block(self, username: str) -> bool:
+        self.blocked.append(username)
+        return True
+
+    def unblock(self, username: str) -> bool:
+        if username in self.blocked:
+            self.blocked.remove(username)
+        return True
+
+    def mute_posts(self, username: str) -> bool:
+        self.muted.append(username)
+        return True
+
+    def unmute_posts(self, username: str) -> bool:
+        if username in self.muted:
+            self.muted.remove(username)
+        return True
+
+    def mute_stories(self, username: str) -> bool:
+        return self.mute_posts(username)
+
+    def unmute_stories(self, username: str) -> bool:
+        return self.unmute_posts(username)
+
+    def archive_thread(self, thread_id: str) -> bool:
+        self.archived.append(thread_id)
+        return True
+
+    def mute_thread(self, thread_id: str) -> bool:
+        return True
+
+    def unmute_thread(self, thread_id: str) -> bool:
+        return True
+
+    def follow_requests(self, amount: int = 20) -> list[Profile]:
+        return list(self._profiles.values())[:amount]
+
+    def approve_follow_request(self, username: str) -> bool:
+        self.approved.append(username)
+        return True
+
+    def decline_follow_request(self, username: str) -> bool:
+        self.declined.append(username)
+        return True
+
+    # -------------------------------------------------------------- extras
+    def highlights(self, username: str) -> list[dict]:
+        return [{"id": "1", "title": "Highlights", "items": 3}]
+
+    def story_viewers(self, story_pk: str) -> list[Profile]:
+        return list(self._profiles.values())[:5]
+
+    def insights(self) -> dict:
+        return {"impressions": 1234, "reach": 5678}
+
+    def reels(self, username: str, amount: int = 10) -> list[Media]:
+        return [m for m in self._media.values() if m.media_type == 8][:amount]
+
+    def thread_messages(self, thread_id: str, amount: int = 20) -> list[Message]:
+        thread = self._threads.get(thread_id)
+        return list(thread.messages)[-amount:] if thread else []
+
+    # ---------------------------------------------------------- publishing
+    def publish_photo(self, path: str, caption: str = "") -> Media | None:
+        self.published.append(("photo", path, caption))
+        return self.add_media(self.own_username, caption)
+
+    def publish_video(self, path: str, caption: str = "") -> Media | None:
+        self.published.append(("video", path, caption))
+        return self.add_media(self.own_username, caption)
+
+    def publish_story(self, path: str, caption: str = "") -> str:
+        self.published.append(("story", path, caption))
+        return self._next_id()
 
     # -------------------------------------------------------------- status
     def health(self) -> dict[str, Any]:

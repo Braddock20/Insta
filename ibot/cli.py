@@ -7,6 +7,7 @@ works the same whether it runs on your laptop or on a Render free instance.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import sys
@@ -23,6 +24,8 @@ from .dm import DMBot
 from .guardrails import Guardrails
 from .keepalive import KeepAlive
 from .media import MediaBot
+from .realtime import RealtimeBridge
+from .risk import RiskGuard
 from .rules import Rulebook
 from .session import LoginError, SessionManager
 from .store import Store
@@ -51,10 +54,12 @@ def _prepare(args) -> tuple:
     return cfg, store, guardrails, rulebook, ai
 
 
-def _client(cfg) -> tuple:
+def _client(cfg, risk=None) -> tuple:
     """Open a session and return ``(session, api_client)``."""
     session = SessionManager(cfg)
     api = session.open()
+    if risk is not None:
+        api.risk = risk
     return session, api
 
 
@@ -305,17 +310,33 @@ def cmd_autopilot(args) -> int:
 
 def cmd_watch(args) -> int:
     cfg, store, guardrails, rulebook, ai = _prepare(args)
-    session, api = _client(cfg)
+    risk = RiskGuard(cfg, store)
+    session, api = _client(cfg, risk=risk)
 
-    media = MediaBot(api, cfg, store, guardrails)
+    media = MediaBot(api, cfg, store, guardrails, risk=risk)
     router = CommandRouter(
-        api, cfg, store=store, guardrails=guardrails, session=session, media=media
+        api,
+        cfg,
+        store=store,
+        guardrails=guardrails,
+        session=session,
+        media=media,
+        risk=risk,
+        protocol=session.protocol,
     )
-    bot = DMBot(api, cfg, store, guardrails, rulebook, ai, command_router=router)
+    bot = DMBot(api, cfg, store, guardrails, rulebook, ai, command_router=router, risk=risk)
 
     if args.prime:
         bot.prime()
         print("✅ the inbox was recorded as seen; nothing will be answered")
+
+    # The push channel. When Instagram delivers a message over the socket
+    # the bot answers it straight away instead of waiting for the poll.
+    bridge = None
+    if bool(cfg.get("realtime.enabled", True)):
+        bridge = RealtimeBridge(api.cl, cfg, on_message=bot.handle_realtime)
+        bridge.start()
+        print("📡 the push channel is connecting — answers will come in seconds")
 
     keepalive = None
     httpd = None
@@ -378,6 +399,7 @@ def cmd_watch(args) -> int:
                 try:
                     session.rebuild()
                     api = session.client()
+                    api.risk = risk
                     bot.client = api
                     router.client = api
                     media.client = api
@@ -397,14 +419,15 @@ def cmd_watch(args) -> int:
         if args.once:
             break
 
-        # Sleep in small slices so Ctrl-C is instant.
-        waited = 0.0
-        while waited < poll and not stopping["flag"]:
-            time.sleep(min(1.0, poll - waited))
-            waited += 1.0
+        # Wait for the next tick, but wake immediately if a message arrives
+        # over the push channel.
+        if bot.wake.wait(timeout=poll):
+            bot.wake.clear()
 
     if keepalive:
         keepalive.stop()
+    if bridge is not None:
+        bridge.stop()
     if httpd is not None:
         try:
             httpd.shutdown()
@@ -478,6 +501,73 @@ def cmd_stats(args) -> int:
     print("\nrecent actions:")
     for row in store.recent_actions(limit=10):
         print(f"  {row['kind']} {row['target'] or ''} {row['detail'] or ''}".rstrip())
+    return 0
+
+
+def cmd_protocol(args) -> int:
+    """Show or re-check the app identity the bot is wearing."""
+    cfg, store, *_ = _prepare(args)
+    session = SessionManager(cfg)
+    api = session.open()
+    protocol = session.protocol
+
+    if args.probe:
+        print("probing every known identity…")
+        results = protocol.probe(api.cl)
+        for r in results:
+            mark = "✅" if r["ok"] else "❌"
+            print(f"{mark} {r['version']} (app id {r['app_id']}) — {r['detail']} [{r['ms']} ms]")
+    else:
+        state = protocol.state
+        print(f"app id      : {state.identity.app_id}")
+        print(f"version     : {state.identity.version} ({state.identity.version_code})")
+        print(f"device      : {state.identity.manufacturer} {state.identity.model}")
+        print(f"working     : {state.working} — {state.detail}")
+        print("\nknown identities:")
+        for c in protocol.candidates():
+            print(f"  {c['version']:<18} app id {c['app_id']}  {c['label']}")
+    api.close()
+    return 0
+
+
+def cmd_realtime(args) -> int:
+    """Test the push channel."""
+    cfg, store, *_ = _prepare(args)
+    session, api = _client(cfg)
+
+    got = []
+    bridge = RealtimeBridge(api.cl, cfg, on_message=lambda m: got.append(m))
+    print("connecting to the push channel…")
+    bridge.start()
+
+    deadline = time.time() + (args.seconds or 60)
+    while time.time() < deadline:
+        if bridge.connected and not args.expect:
+            break
+        if got:
+            break
+        time.sleep(0.5)
+
+    print(json.dumps(bridge.health(), indent=2, default=str))
+    if got:
+        print(f"\n✅ {len(got)} message(s) arrived over the push channel")
+        for m in got[:5]:
+            print(f"   thread {m.thread_id}: {m.text[:60]!r}")
+    elif bridge.connected:
+        print("\n✅ the push channel is connected and subscribed (no message arrived in the window)")
+    else:
+        print("\n⚠️  the push channel did not connect — the bot will fall back to polling")
+    bridge.stop()
+    api.close()
+    return 0
+
+
+def cmd_risk(args) -> int:
+    """Show the risk dashboard."""
+    cfg, store, *_ = _prepare(args)
+    risk = RiskGuard(cfg, store)
+    for key, value in risk.score().items():
+        print(f"{key}: {value}")
     return 0
 
 
@@ -564,6 +654,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats = sub.add_parser("stats", help="show the counters")
     stats.set_defaults(func=cmd_stats)
+
+    protocol = sub.add_parser("protocol", help="the app identity the bot is wearing")
+    protocol.add_argument("--probe", action="store_true", help="test every known identity")
+    protocol.set_defaults(func=cmd_protocol)
+
+    realtime = sub.add_parser("realtime", help="test the push channel")
+    realtime.add_argument("--seconds", type=int, help="how long to listen")
+    realtime.add_argument("--expect", action="store_true", help="wait for a real message")
+    realtime.set_defaults(func=cmd_realtime)
+
+    risk = sub.add_parser("risk", help="the risk dashboard")
+    risk.set_defaults(func=cmd_risk)
 
     return p
 

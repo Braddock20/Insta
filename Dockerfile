@@ -4,6 +4,16 @@
 # point. Chromium would need 400–500 MB on its own, which is the entire
 # memory budget of a free Render instance. This one runs in well under 100 MB.
 
+# --- the fast engine ---------------------------------------------------
+# The Rust half: bulk listing of the follower/following chains, the diff
+# between them, and the actions that go with them. It is optional at
+# runtime — the bot falls back to Python when the binary is not there.
+FROM rust:1-slim AS engine
+WORKDIR /build
+COPY rust/igfast ./rust/igfast
+RUN cd rust/igfast && cargo build --release && \
+    cp target/release/igfast /build/igfast
+
 FROM python:3.11-slim
 
 # glibc spawns a malloc arena per thread, which quietly wastes memory in a
@@ -22,7 +32,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 # Installs the package itself, which puts the `igbot` command on the PATH.
 RUN pip install --no-cache-dir -e . \
-    && mkdir -p /app/state /app/logs /app/secrets
+    && mkdir -p /app/state /app/logs /app/secrets /app/bin
+
+COPY --from=engine /build/igfast /app/bin/igfast
+RUN chmod +x /app/bin/igfast
 
 EXPOSE 8000
 

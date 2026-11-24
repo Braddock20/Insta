@@ -18,15 +18,29 @@ All the real work lives in the client and in the media helpers.
 
 from __future__ import annotations
 
+import json
 import shlex
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Callable
 
 from . import log
 from .client.base import Thread
 
 log = log.get(__name__)
+
+
+class CommandResult:
+    """A command answer that may also carry file attachments (e.g. JSON lists)."""
+
+    def __init__(self, text: str, files: list[str] | None = None):
+        self.text = text or ""
+        self.files = list(files or [])
+
+    def __str__(self) -> str:
+        return self.text
 
 
 class CommandError(RuntimeError):
@@ -121,8 +135,9 @@ class CommandRouter:
         time takes a second.
         """
         if workers is None:
-            workers = int(self.cfg.get("speed.commands_parallel", 8) or 8)
-        workers = max(1, min(int(workers), 32))
+            workers = int(self.cfg.get("speed.commands_parallel", 32) or 32)
+        # No artificial ceiling — use what the machine and config allow
+        workers = max(1, int(workers))
         if workers == 1 or len(items) <= 1:
             return [fn(item) for item in items]
 
@@ -135,6 +150,20 @@ class CommandRouter:
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             return list(pool.map(guarded, items))
+
+    def _with_json(self, text: str, data: Any, stem: str = "list") -> CommandResult:
+        """Attach a JSON file with the full list so the chat answer stays short."""
+        try:
+            payload = data
+            if isinstance(data, list) and data and not isinstance(data[0], (str, int, float, bool, type(None))):
+                # already dict-like rows
+                payload = data
+            path = Path(tempfile.gettempdir()) / f"igbot_{stem}_{int(time.time())}.json"
+            path.write_text(json.dumps(payload, indent=2, default=str, ensure_ascii=False), encoding="utf-8")
+            return CommandResult(text, files=[str(path)])
+        except Exception as exc:  # noqa: BLE001
+            log.debug("could not attach json: %s", exc)
+            return CommandResult(text)
 
     def _limit(self, args: list[str], default: int = 0) -> int:
         """How many of something. 0 means *all of them*."""
@@ -272,27 +301,37 @@ class CommandRouter:
         @self.register("help", "show this list")
         def _help(args, thread):
             groups = [
-                ("Basics", ["help", "whoami", "status", "health", "relogin", "ping", "uptime", "about", "version", "engine"]),
-                ("Inbox", ["inbox", "threads", "unread", "last", "requests", "accept", "reply", "send", "react", "clear", "dms", "dmsearch"]),
-                ("Stories", ["stories", "storyview", "storylike", "storiesall", "viewall", "storyreply", "viewers", "highlights"]),
-                ("Posts", ["post", "like", "unlike", "comments", "comment", "feed", "reels"]),
-                ("People", ["profile", "follow", "unfollow", "followers", "following", "followback", "mutuals", "search"]),
-                ("The graph", ["scan", "nonfollowers", "fans", "unfollowers"]),
-                ("Notes", ["notes", "note", "notelike"]),
-                ("Moderation", ["block", "unblock", "muteposts", "unmuteposts", "mutestories", "unmutestories", "archive", "mute", "unmute", "followrequests", "approve", "decline"]),
-                ("Publishing", ["postphoto", "postvideo", "storypost"]),
-                ("Automation", ["auto", "autolike", "autoview", "autostory", "autofollow", "autocomment", "autonote", "autowelcome", "autostorypost"]),
-                ("Safety", ["risk", "quiet", "pause", "resume", "protocol", "protocolprobe", "realtime", "backup"]),
-                ("Limits", ["stats", "caps", "tasks", "cancel"]),
+                ("⚡ Basics", ["help", "whoami", "status", "health", "relogin", "ping", "uptime", "about", "version", "engine"]),
+                ("💬 Inbox", ["inbox", "threads", "unread", "last", "requests", "accept", "reply", "send", "react", "clear", "dms", "dmsearch"]),
+                ("📸 Stories", ["stories", "storyview", "storylike", "storiesall", "viewall", "storyreply", "viewers", "highlights"]),
+                ("🖼 Posts", ["post", "like", "unlike", "comments", "comment", "feed", "reels"]),
+                ("👥 People", ["profile", "follow", "unfollow", "followers", "following", "followback", "mutuals", "search"]),
+                ("🕸 The graph", ["scan", "nonfollowers", "fans", "unfollowers"]),
+                ("📝 Notes", ["notes", "note", "notelike"]),
+                ("🛡 Moderation", ["block", "unblock", "muteposts", "unmuteposts", "mutestories", "unmutestories", "archive", "mute", "unmute", "followrequests", "approve", "decline"]),
+                ("🚀 Publishing", ["postphoto", "postvideo", "storypost"]),
+                ("🤖 Automation", ["auto", "autolike", "autoview", "autostory", "autofollow", "autocomment", "autonote", "autowelcome", "autostorypost"]),
+                ("🔒 Safety", ["risk", "quiet", "pause", "resume", "protocol", "protocolprobe", "realtime", "backup"]),
+                ("📊 Limits", ["stats", "caps", "tasks", "cancel"]),
             ]
-            lines = ["InstaBaileys — commands you can send to yourself:", ""]
+            lines = [
+                "╔══════════════════════════════════════╗",
+                "║     ⚡  InstaBaileys Command Center  ║",
+                "╚══════════════════════════════════════╝",
+                "",
+                "Send any of these to yourself. Lists also come with a JSON file.",
+                "",
+            ]
             for title, names in groups:
-                lines.append(f"*{title}*")
+                lines.append(f"▸ {title}")
+                lines.append("─" * 36)
                 for n in names:
                     help_text = self._commands.get(n, ("", None))[0]
-                    lines.append(f"/{n} — {help_text}")
+                    lines.append(f"  /{n}")
+                    if help_text:
+                        lines.append(f"      {help_text}")
                 lines.append("")
-            lines.append(f"{len(self._commands)} commands.")
+            lines.append(f"✦ {len(self._commands)} commands ready · turbo mode on")
             return "\n".join(lines)
 
         @self.register("whoami", "the account this bot is running as")
@@ -655,11 +694,12 @@ class CommandRouter:
             if not people:
                 return "no followers to show"
             path = self._dump("followers", user, people)
+            names = [p.username for p in people]
             lines = [f"{len(people)} followers of @{user}:"]
-            lines += [f"@{p.username}" for p in people[:60]]
+            lines += [f"@{n}" for n in names[:60]]
             if len(people) > 60:
-                lines.append(f"… and {len(people) - 60} more — the whole list is in {path}")
-            return "\n".join(lines)
+                lines.append(f"… and {len(people) - 60} more")
+            return self._with_json("\n".join(lines), names, f"followers_{user}")
 
         @self.register("following", "everyone you follow: /following [user] [n|all]")
         def _following(args, thread):
@@ -670,11 +710,12 @@ class CommandRouter:
             if not people:
                 return "not following anyone"
             path = self._dump("following", user, people)
+            names = [p.username for p in people]
             lines = [f"{len(people)} accounts @{user} follows:"]
-            lines += [f"@{p.username}" for p in people[:60]]
+            lines += [f"@{n}" for n in names[:60]]
             if len(people) > 60:
-                lines.append(f"… and {len(people) - 60} more — the whole list is in {path}")
-            return "\n".join(lines)
+                lines.append(f"… and {len(people) - 60} more")
+            return self._with_json("\n".join(lines), names, f"following_{user}")
 
         @self.register("followback", "follow the people who followed you")
         def _followback(args, thread):
@@ -739,13 +780,14 @@ class CommandRouter:
             if not rows:
                 return "everyone you follow follows you back"
             limit = self._limit(args[1:]) or 40
+            names = [str(row.get("username") or row.get("pk")) for row in rows]
             lines = [f"{len(rows)} people you follow do not follow you back:"]
-            for row in rows[:limit]:
-                lines.append(f"@{row.get('username') or row.get('pk')}")
+            for name in names[:limit]:
+                lines.append(f"@{name}")
             if len(rows) > limit:
                 lines.append(f"… and {len(rows) - limit} more")
             lines.append("/unfollowers removes them")
-            return "\n".join(lines)
+            return self._with_json("\n".join(lines), names, "nonfollowers")
 
         @self.register("fans", "the people who follow you that you do not follow back")
         def _fans(args, thread):
@@ -753,26 +795,27 @@ class CommandRouter:
             if not rows:
                 return "you follow everybody who follows you"
             limit = self._limit(args[1:]) or 40
+            names = [str(row.get("username") or row.get("pk")) for row in rows]
             lines = [f"{len(rows)} people follow you but you do not follow back:"]
-            for row in rows[:limit]:
-                lines.append(f"@{row.get('username') or row.get('pk')}")
+            for name in names[:limit]:
+                lines.append(f"@{name}")
             if len(rows) > limit:
                 lines.append(f"… and {len(rows) - limit} more")
-            return "\n".join(lines)
+            return self._with_json("\n".join(lines), names, "fans")
 
-        @self.register("unfollowers", "unfollow the people who do not follow back")
+        @self.register("unfollowers", "unfollow the people who do not follow back (instant). Add 'dry' to only preview.")
         def _unfollowers(args, thread):
-            """Remove the non-followers.
+            """Remove the non-followers immediately.
 
-            A rehearsal comes first — the plan is printed, nothing is touched.
-            ``yes`` is what actually does it.
+            By default this *does* the unfollows. Pass ``dry`` / ``rehearse`` /
+            ``preview`` if you only want to see the list first.
             """
             rows = self._graph("nonfollowers")
             if not rows:
                 return "there is nobody to remove"
 
             limit = self._limit(args[:1], default=int(self.cfg.get("unfollow.limit", 0) or 0))
-            confirm = any(a.lower() in ("yes", "y", "do", "go") for a in args[1:])
+            dry = any(a.lower() in ("dry", "rehearse", "preview", "plan", "list") for a in args)
             whitelist = {
                 name.strip().lstrip("@").lower()
                 for name in str(self.cfg.get("unfollow.whitelist", "") or "").split(",")
@@ -797,18 +840,23 @@ class CommandRouter:
             if not targets:
                 return "everybody on the list is on the whitelist"
 
-            if not confirm:
+            if dry:
                 lines = [
-                    f"🧪 rehearsal — {len(targets)} account(s) would be unfollowed:",
+                    f"🧪 dry-run — {len(targets)} account(s) would be unfollowed:",
                     *[f"@{row.get('username') or row.get('pk')}" for row in targets[:40]],
                 ]
                 if len(targets) > 40:
                     lines.append(f"… and {len(targets) - 40} more")
-                lines.append("send /unfollowers yes to do it for real")
-                return "\n".join(lines)
+                lines.append("send /unfollowers  (no args) to do it for real")
+                return self._with_json("\n".join(lines), [r.get("username") for r in targets], "unfollowers_dry")
 
+            # Fast path: turbo = almost no gap
+            turbo = bool(self.cfg.get("speed.turbo", True))
             gap_min = float(self.cfg.get("unfollow.gap_min", 20) or 0)
             gap_max = float(self.cfg.get("unfollow.gap_max", 60) or 0)
+            if turbo:
+                gap_min = min(gap_min, 2.0)
+                gap_max = min(gap_max, 5.0)
             if gap_max < gap_min:
                 gap_max = gap_min
             done: list[str] = []
@@ -830,12 +878,12 @@ class CommandRouter:
                         self.store.record_action("unfollow", target=name, detail="non-follower")
                 else:
                     failed.append(f"@{name} (refused)")
-                if gap_max:
+                if gap_max > 0:
                     time.sleep(gap_min + (time.time() % max(0.001, gap_max - gap_min)))
             lines = [f"✅ unfollowed {len(done)} account(s)"]
             if failed:
                 lines.append(f"⚠️  {len(failed)} skipped: " + ", ".join(failed[:10]))
-            return "\n".join(lines)
+            return self._with_json("\n".join(lines), done, "unfollowers_done")
 
         @self.register("engine", "which engine is working and how fast it is")
         def _engine(args, thread):

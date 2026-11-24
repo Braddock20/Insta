@@ -7,13 +7,14 @@ of half a gigabyte, answers in seconds instead of minutes, and stays logged
 in.
 
 It is a working bot, not a framework: it answers DMs, reads notes, views and
-likes stories, follows people back, and takes **48 commands** by DM to
-yourself.
+likes stories, follows people back, and takes **81 commands** by DM to
+yourself. New messages arrive over Instagram's push channel, so the answer
+lands in seconds, not minutes.
 
 ```
-   customer DM ──▶ Instagram API ──▶ InstaBaileys ──▶ rulebook / AI ──▶ reply
-                                       │
-                                       └──▶ guards (caps, cooldowns, pacing)
+   customer DM ──▶ Instagram push channel ──▶ InstaBaileys ──▶ rulebook / AI ──▶ reply
+                (or the poll, if push is down)   │
+                                                  └──▶ risk guard (caps, gaps, safe mode)
 ```
 
 ---
@@ -158,7 +159,28 @@ every account and needs no extra app.
 /auto          the automatic actions  /autolike      like posts
 /autoview      view stories           /autostory     like stories
 /autofollow    follow back            /autocomment   answer comments
-/autonote      read the notes
+/autonote      read the notes         /autowelcome   greet new followers
+/autostorypost publish a story
+
+/search        find an account        /mutuals       mutual followers
+/dmsearch      search the chats       /dms <id>      read a conversation
+/reels         the reels              /highlights    the highlights
+/viewers       who saw a story       /insights      the account's numbers
+
+/block         block an account       /unblock       unblock
+/muteposts     mute their posts       /unmuteposts   unmute
+/mutestories   mute their stories     /unmutestories unmute
+/archive       hide a conversation    /mute          mute a conversation
+/unmute        unmute a conversation  /followrequests the accounts waiting
+/approve       accept a follow request /decline     refuse a follow request
+
+/postphoto     publish a photo        /postvideo     publish a video
+/storypost     publish a story
+
+/risk          the risk dashboard     /quiet <min>   act later
+/pause         stop answering         /resume        start answering
+/protocol      the app identity       /protocolprobe test every identity
+/realtime      the push channel       /backup        copy the state aside
 
 /stats         the counters           /caps          today's budget
 /tasks         the queue              /cancel        cancel a task
@@ -188,9 +210,12 @@ restart.
 | `/autofollow` | Follows the accounts that followed you and that you do not follow back. |
 | `/autonote` | Reads the notes that arrive and records them. |
 | `/autocomment` | Answers the comments on your posts. |
+| `/autowelcome` | Says hello to new followers. `{username}` is replaced with their name. |
+| `/autostorypost` | Publishes the next photo from `automations.story_folder` as a story. |
 
-Every one of them is off by default, goes through the daily caps, and never
-touches the same account twice in a day.
+Every one of them is off by default, goes through the risk guard (the daily
+ceiling, the gap between actions, the warm-up ramp), and never touches the
+same account twice in a day.
 
 ### What Instagram does not allow
 
@@ -366,7 +391,114 @@ This is the part every bot gets wrong, so it is worth being explicit.
 
 ---
 
-## Architecture
+## Realtime — the answer lands in seconds
+
+Instagram's phone app keeps a WebSocket open to Instagram's own messaging
+push service (MQTToT). InstaBaileys uses the same channel, so a new message
+is *pushed* to the bot the moment it arrives instead of being discovered on
+the next poll.
+
+The push carries the whole message: the thread, the sender, the text and the
+timestamp. The bot can therefore answer **without reading the inbox at
+all** — no ten-second inbox request, no waiting for the poll.
+
+Two details decide whether this works, and both are easy to get wrong:
+
+* **Subscribe.** The socket connecting is not enough. Until the bot
+  subscribes to the message stream with the sequence id the inbox hands
+  out, the connection stays silent forever.
+* **Read the socket.** The events are dispatched while the socket is read. A
+  client that connects and then never reads receives nothing.
+
+Both are handled in `ibot/realtime.py`, along with the reconnection logic:
+Instagram closes idle push connections, so the bridge reconnects with a
+back-off and re-subscribes, forever.
+
+If the push channel cannot be established the bot falls back to polling. It
+is an accelerator, never a dependency.
+
+```bash
+igbot realtime                 # is the push channel up?
+igbot realtime --expect        # wait for a real message to arrive
+```
+
+---
+
+## The risk controls
+
+No unofficial automation is zero risk. What can be done is making the
+account's behaviour so ordinary that there is nothing to flag. That is what
+the risk guard does, and it is the part of this bot that matters most.
+
+```yaml
+risk:
+  requests_per_hour: 600
+  daily_visible_ceiling: 60
+  min_visible_gap_seconds: 20
+  max_visible_gap_seconds: 75
+  burst_limit: 3
+  burst_window_seconds: 600
+  dedupe_hours: 12
+  warmup_days: [2, 6, 13]
+  safe_mode_minutes: 60
+```
+
+1. **A global gap between visible actions.** Every like, follow, story view,
+   comment and welcome is separated from the previous one by a random pause
+   of 20–75 seconds. A human does not like forty posts in a row. This one
+   rule removes more risk than every other rule together.
+2. **A burst limit.** At most three visible actions inside any ten minutes.
+3. **A daily ceiling on everything.** The per-kind caps allow 100 likes and
+   20 follows; the ceiling caps the total at 60.
+4. **A warm-up ramp.** A new account gets 15% of the budget on day one, 40%
+   after two days, 70% after six, and the full amount after thirteen. An
+   account that suddenly acts at full speed on day one is exactly the
+   profile the systems look for.
+5. **Safe mode.** A rate limit, a forbidden response or a challenge switches
+   the bot to read-only for an hour — and the second breach costs twice as
+   long. The bot stops before it is stopped.
+6. **Content de-duplication.** The same text is never sent twice in twelve
+   hours, because a human does not paste the same sentence twelve times.
+
+`igbot risk` (or `/risk` by DM) shows the whole picture: how much of today's
+budget is spent, how many breaches there have been, and whether safe mode is
+on.
+
+---
+
+## Owning the protocol — your own instagrapi
+
+Instagram's private API expects a very specific identity: an app id, an app
+version, a version code, a device model and a matching user agent. When Meta
+ships a new version of the app, the old identity starts failing quietly —
+requests come back empty, the account is asked to verify itself, or the
+session is dropped. That is the most common reason a bot stops working
+overnight.
+
+Upstream libraries pin one version in their source, so fixing it means
+waiting for a release, or forking and editing a constant. This bot owns the
+version instead:
+
+* `ibot/protocol.py` keeps a **registry of app identities**, newest first;
+* it can **probe** them against the live account and see which ones
+  Instagram still honours;
+* it **persists the winner** in `state/protocol.json`, so every restart
+  wears the identity that worked today;
+* it **re-probes** when the account starts misbehaving, and switches without
+  a code change.
+
+```bash
+igbot protocol           # what is the bot wearing right now?
+igbot protocol --probe   # test every known identity
+```
+
+So the answer to "can we run our own instagrapi against the updated
+Instagram" is: you do not need to fork a hundred files to keep up with Meta.
+You need to own the seam — the identity, the errors, the session and the
+push channel — and let the transport underneath be replaceable. That is what
+this layer is, and it is where your changes go when Meta moves.
+
+---
 
 ```
 ibot/
@@ -375,8 +507,11 @@ ibot/
 │   ├── ig.py       the live client — Instagram's API over HTTP
 │   └── fake.py     an in-memory fake, so the tests need no account
 ├── session.py      login, the saved device identity, re-auth
+├── protocol.py     the app identity: the registry, the probe, the upgrade
+├── realtime.py     the push channel: subscribe, read, reconnect
+├── risk.py         the risk guard: gaps, bursts, ceilings, safe mode
 ├── dm.py           the inbox loop: dedupe, guardrails, reply
-├── commands.py     the 48 commands
+├── commands.py     the 81 commands
 ├── media.py        the automatic visible actions
 ├── guardrails.py   cooldowns, caps, the audit trail
 ├── rules.py        the rulebook
@@ -388,8 +523,13 @@ ibot/
 ```
 
 Everything the bot does goes through `client/base.py`. That is why the whole
-suite runs in six seconds without a network, and why the transport can be
+suite runs in a few seconds without a network, and why the transport can be
 swapped without touching the business logic.
+
+The three layers worth reading first, because they are the ones that keep the
+account alive: `protocol.py` (the identity Instagram sees), `risk.py` (the
+behaviour Instagram sees) and `realtime.py` (the channel Instagram pushes
+on).
 
 ---
 
@@ -401,7 +541,8 @@ swapped without touching the business logic.
 
 The suite runs against the fake client: no account, no network, no browser.
 It covers the reply path, the dedupe, the caps, the rulebook, the command
-router, the automatic actions, the store and the HTTP API.
+router, the automatic actions, the risk guard, the protocol layer, the push
+payload parsing, the store and the HTTP API.
 
 ---
 

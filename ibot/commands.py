@@ -863,27 +863,38 @@ class CommandRouter:
             failed: list[str] = []
             for row in targets:
                 name = str(row.get("username") or "")
-                pk = str(row.get("pk") or "")
+                pk = str(row.get("pk") or row.get("user_id") or "")
                 if self.guardrails is not None:
-                    decision = self.guardrails.check_action("unfollow", target=name)
+                    decision = self.guardrails.check_action("unfollow", target=name or pk)
                     if not decision.allowed:
-                        failed.append(f"@{name} ({decision.reason})")
+                        failed.append(f"@{name or pk} ({decision.reason})")
                         continue
-                ok = self.client.unfollow_by_id(pk, name)
+                try:
+                    # Always prefer the numeric pk already stored in the graph.
+                    # Never force a username→id lookup when pk is present.
+                    ok = self.client.unfollow_by_id(pk, name)
+                except Exception as exc:  # noqa: BLE001
+                    # One bad account must never abort the whole batch
+                    failed.append(f"@{name or pk} ({type(exc).__name__})")
+                    log.warning("unfollow failed for @%s (pk=%s): %s", name, pk, exc)
+                    ok = False
                 if ok:
-                    done.append(name)
+                    done.append(name or pk)
                     if self.guardrails is not None:
-                        self.guardrails.record_action("unfollow", target=name, detail="non-follower")
+                        self.guardrails.record_action("unfollow", target=name or pk, detail="non-follower")
                     if self.store is not None:
-                        self.store.record_action("unfollow", target=name, detail="non-follower")
+                        self.store.record_action("unfollow", target=name or pk, detail="non-follower")
                 else:
-                    failed.append(f"@{name} (refused)")
+                    if not any((name and name in f) or (pk and pk in f) for f in failed):
+                        failed.append(f"@{name or pk} (refused)")
                 if gap_max > 0:
                     time.sleep(gap_min + (time.time() % max(0.001, gap_max - gap_min)))
             lines = [f"✅ unfollowed {len(done)} account(s)"]
             if failed:
-                lines.append(f"⚠️  {len(failed)} skipped: " + ", ".join(failed[:10]))
-            return self._with_json("\n".join(lines), done, "unfollowers_done")
+                lines.append(f"⚠️  {len(failed)} skipped: " + ", ".join(failed[:15]))
+                if len(failed) > 15:
+                    lines.append(f"… and {len(failed) - 15} more")
+            return self._with_json("\n".join(lines), {"done": done, "failed": failed}, "unfollowers_done")
 
         @self.register("engine", "which engine is working and how fast it is")
         def _engine(args, thread):

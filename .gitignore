@@ -1,12 +1,33 @@
+# Secrets — never commit these.
 secrets/
+*.session
+cookies.txt
+*.cookies.txt
+
+# Local state.
 state/
 logs/
-probe/
 *.db
-*.sqlite
 *.sqlite3
-__pycache__/
-*.pyc
+*.log
+
+# The saved session and device identity. This file is what makes the bot look
+# like the same phone on every restart — keep a copy, but do not commit it.
+session.json
+
+# Python.
 .venv/
+venv/
+__pycache__/
+*.py[cod]
 .pytest_cache/
-config.local.yaml
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Editors and OS.
+.vscode/
+.idea/
+.DS_Store

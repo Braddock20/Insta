@@ -130,6 +130,8 @@ def test_a_pushed_command_is_answered(client, cfg, store, guardrails, rulebook):
     bot = DMBot(client, cfg, store, guardrails, rulebook, command_router=router)
     push = RealtimeMessage(thread_id="t3", message_id="m9", user_id="1", text="/whoami")
     bot.handle_realtime(push)
+    # The push is answered by a worker thread, so wait for it.
+    bot.drain()
     assert client.sent
     assert "@me" in client.sent[-1][1]
 

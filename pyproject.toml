@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "instabaileys"
+version = "1.0.0"
+description = "The Baileys for Instagram — an Instagram bot that speaks the API, not the browser."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "instagrapi>=3.2.19",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+# `igbot login`, `igbot watch`, ... after `pip install -e .`
+igbot = "ibot.cli:main"
+
+[tool.setuptools]
+packages = ["ibot", "ibot.client"]

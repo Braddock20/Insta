@@ -20,10 +20,13 @@ audit trail — just a much smaller transport.
 from __future__ import annotations
 
 import re
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
 from .. import log
+from ..bulk import BulkEngine
 from .base import (
     BaseClient,
     Comment,
@@ -37,6 +40,42 @@ from .base import (
 )
 
 log = log.get(__name__)
+
+
+@contextmanager
+def turbo(client):
+    """Drop the human pause for a burst of read-only calls.
+
+    Instagram is happy to answer a hundred requests a second. The pause
+    instagrapi inserts between calls is there to *look* human, not to be
+    correct — but a full scan of a large account is hundreds of pages of
+    JSON, and two seconds of pause on each one turns a forty-second job into
+    four minutes. The pause comes straight back the moment the scan is over,
+    and the visible actions keep their own, much slower, rhythm.
+    """
+    touched: list[tuple[Any, str, Any]] = []
+    private = getattr(client, "private", None)
+    for owner, attr, value in (
+        (private, "request_timeout", 0),
+        (private, "timeout", 0),
+        (private, "delay_range", [0, 0]),
+        (client, "delay_range", [0, 0]),
+    ):
+        if owner is None:
+            continue
+        try:
+            touched.append((owner, attr, getattr(owner, attr)))
+            setattr(owner, attr, value)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        yield
+    finally:
+        for owner, attr, value in touched:
+            try:
+                setattr(owner, attr, value)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class InstagramError(RuntimeError):
@@ -80,6 +119,11 @@ class ApiClient(BaseClient):
         # Optional risk guard. When it is attached, every call goes through
         # the budget check and every failure is looked at.
         self.risk = None
+        # The bulk engine — the part that can walk a whole follower list.
+        self.bulk = BulkEngine(cfg, self)
+        # Visible actions are serialised. Reads run in parallel; writes do
+        # not, because Instagram does not like two of them at once.
+        self._write_lock = threading.Lock()
 
     # ------------------------------------------------------------- plumbing
     def _call(self, fn: Callable, *args, **kwargs):
@@ -385,29 +429,55 @@ class ApiClient(BaseClient):
         raw = self._call(self.cl.user_medias, uid, amount) or []
         return [self._to_media(m) for m in raw]
 
-    def followers(self, username: str, amount: int = 50) -> list[Profile]:
+    def connections(self, kind: str, username: str, amount: int = 0) -> list[Profile]:
+        """Every follower or every following account.
+
+        ``amount`` of 0 means *the whole list* — every page of the cursor
+        chain, not the first one. That is the difference between knowing
+        thirty of your followers and knowing all of them.
+        """
         uid = self.user_id(username)
-        raw = self._call(self.cl.user_followers_v1, uid, amount) or []
+        result = self.bulk.list_connections(kind, uid, limit=amount)
         return [
             Profile(
-                user_id=str(getattr(u, "pk", "") or ""),
-                username=getattr(u, "username", "") or "",
-                full_name=getattr(u, "full_name", "") or "",
+                user_id=str(u.get("pk") or ""),
+                username=str(u.get("username") or ""),
+                full_name=str(u.get("full_name") or ""),
+                is_private=bool(u.get("is_private")),
+                is_verified=bool(u.get("is_verified")),
             )
-            for u in raw
+            for u in result.users
         ]
 
+    def followers(self, username: str, amount: int = 50) -> list[Profile]:
+        return self.connections("followers", username, amount)
+
     def following(self, username: str, amount: int = 50) -> list[Profile]:
-        uid = self.user_id(username)
-        raw = self._call(self.cl.user_following_v1, uid, amount) or []
-        return [
-            Profile(
-                user_id=str(getattr(u, "pk", "") or ""),
-                username=getattr(u, "username", "") or "",
-                full_name=getattr(u, "full_name", "") or "",
-            )
-            for u in raw
-        ]
+        return self.connections("following", username, amount)
+
+    def follow_by_id(self, user_id: str) -> bool:
+        """Follow by id — the bulk path never needs the username."""
+        fn = getattr(self.cl, "user_friendship_v1", None)
+        if fn is None:
+            return False
+        try:
+            with self._write_lock:
+                return bool(self._call(fn, str(user_id)))
+        except InstagramError:
+            return False
+
+    def unfollow_by_id(self, user_id: str, username: str = "") -> bool:
+        """Unfollow by id, or by name when only the name is known."""
+        if username:
+            return self.unfollow(username)
+        fn = getattr(self.cl, "user_friendship_v1_unfollow", None)
+        if fn is None:
+            return False
+        try:
+            with self._write_lock:
+                return bool(self._call(fn, str(user_id)))
+        except InstagramError:
+            return False
 
     def follow(self, username: str) -> bool:
         uid = self.user_id(username)
@@ -437,6 +507,8 @@ class ApiClient(BaseClient):
                     username=getattr(user, "username", "") or "",
                     created_at=self._epoch(getattr(n, "created_at", None)),
                     expires_at=self._epoch(getattr(n, "expires_at", None)),
+                    thread_id=str(getattr(n, "thread_id", "") or ""),
+                    media_id=str(getattr(n, "media_id", "") or ""),
                 )
             )
         return out

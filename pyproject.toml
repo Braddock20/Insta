@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "instabaileys"
-version = "1.0.0"
+version = "1.1.0"
 description = "The Baileys for Instagram — an Instagram bot that speaks the API, not the browser."
 readme = "README.md"
 requires-python = ">=3.10"

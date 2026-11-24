@@ -104,6 +104,7 @@ def test_a_pushed_message_is_answered_without_reading_the_inbox(
         timestamp=0.0,
     )
     bot.handle_realtime(push)
+    bot.drain()
     assert client.sent == [("t1", "Hi there!")]
 
 
@@ -112,6 +113,7 @@ def test_a_pushed_message_is_only_answered_once(client, cfg, store, guardrails, 
     push = RealtimeMessage(thread_id="t1", message_id="m1", user_id="2", text="hello")
     bot.handle_realtime(push)
     bot.handle_realtime(push)
+    bot.drain()
     assert len(client.sent) == 1
 
 
@@ -120,6 +122,7 @@ def test_the_poll_loop_wakes_up_on_a_push(client, cfg, store, guardrails, rulebo
     assert not bot.wake.is_set()
     bot.handle_realtime(RealtimeMessage(thread_id="t1", message_id="m1", user_id="2", text="hello"))
     assert bot.wake.is_set()
+    bot.drain()
 
 
 def test_a_pushed_command_is_answered(client, cfg, store, guardrails, rulebook):
@@ -136,4 +139,5 @@ def test_the_risk_guard_can_stop_a_push_answer(client, cfg, store, guardrails, r
     risk.enter_safe_mode("test", minutes=10)
     bot = DMBot(client, cfg, store, guardrails, rulebook, risk=risk)
     bot.handle_realtime(RealtimeMessage(thread_id="t1", message_id="m1", user_id="2", text="hello"))
+    bot.drain()
     assert client.sent == []

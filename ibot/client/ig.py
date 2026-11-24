@@ -77,13 +77,26 @@ class ApiClient(BaseClient):
         self.cl = client
         self.cfg = cfg
         self._own_user_id = str(getattr(client, "user_id", "") or "")
+        # Optional risk guard. When it is attached, every call goes through
+        # the budget check and every failure is looked at.
+        self.risk = None
 
     # ------------------------------------------------------------- plumbing
     def _call(self, fn: Callable, *args, **kwargs):
         """Run an instagrapi call and translate its failures."""
+        if self.risk is not None:
+            from ..risk import RiskStop
+
+            try:
+                self.risk.before_request()
+            except RiskStop as exc:
+                raise InstagramError(str(exc), kind="risk") from exc
+            self.risk.note_request()
         try:
             return fn(*args, **kwargs)
         except Exception as exc:  # noqa: BLE001 - deliberately broad
+            if self.risk is not None:
+                self.risk.note_failure(exc)
             if _is_reauth_error(exc):
                 raise InstagramError(
                     f"session expired: {type(exc).__name__}: {exc}",
@@ -444,6 +457,189 @@ class ApiClient(BaseClient):
             created_at=self._epoch(getattr(raw, "created_at", None)),
             expires_at=self._epoch(getattr(raw, "expires_at", None)),
         )
+
+    # --------------------------------------------------------- moderation
+    def block(self, username: str) -> bool:
+        uid = self.user_id(username)
+        try:
+            return bool(self._call(self.cl.user_block, uid))
+        except InstagramError:
+            return False
+
+    def unblock(self, username: str) -> bool:
+        uid = self.user_id(username)
+        try:
+            return bool(self._call(self.cl.user_unblock, uid))
+        except InstagramError:
+            return False
+
+    def mute_posts(self, username: str) -> bool:
+        uid = self.user_id(username)
+        try:
+            return bool(self._call(self.cl.mute_posts_from_follow, uid))
+        except InstagramError:
+            return False
+
+    def unmute_posts(self, username: str) -> bool:
+        uid = self.user_id(username)
+        try:
+            return bool(self._call(self.cl.unmute_posts_from_follow, uid))
+        except InstagramError:
+            return False
+
+    def mute_stories(self, username: str) -> bool:
+        uid = self.user_id(username)
+        try:
+            return bool(self._call(self.cl.mute_stories_from_follow, uid))
+        except InstagramError:
+            return False
+
+    def unmute_stories(self, username: str) -> bool:
+        uid = self.user_id(username)
+        try:
+            return bool(self._call(self.cl.unmute_stories_from_follow, uid))
+        except InstagramError:
+            return False
+
+    def archive_thread(self, thread_id: str) -> bool:
+        try:
+            return bool(self._call(self.cl.direct_thread_hide, int(thread_id)))
+        except (InstagramError, ValueError):
+            return False
+
+    def mute_thread(self, thread_id: str) -> bool:
+        try:
+            return bool(self._call(self.cl.direct_thread_mute, int(thread_id)))
+        except (InstagramError, ValueError):
+            return False
+
+    def unmute_thread(self, thread_id: str) -> bool:
+        try:
+            return bool(self._call(self.cl.direct_thread_unmute, int(thread_id)))
+        except (InstagramError, ValueError):
+            return False
+
+    def follow_requests(self, amount: int = 20) -> list[Profile]:
+        raw = self._call(self.cl.user_follow_requests, amount) or []
+        return [
+            Profile(
+                user_id=str(getattr(u, "pk", "") or ""),
+                username=getattr(u, "username", "") or "",
+                full_name=getattr(u, "full_name", "") or "",
+            )
+            for u in raw
+        ]
+
+    def approve_follow_request(self, username: str) -> bool:
+        uid = self.user_id(username)
+        try:
+            return bool(self._call(self.cl.user_follow_requests_approve, [uid]))
+        except InstagramError:
+            try:
+                return bool(self._call(self.cl.user_follow_request_approve, uid))
+            except InstagramError:
+                return False
+
+    def decline_follow_request(self, username: str) -> bool:
+        uid = self.user_id(username)
+        try:
+            return bool(self._call(self.cl.user_follow_requests_decline, [uid]))
+        except InstagramError:
+            try:
+                return bool(self._call(self.cl.user_follow_request_decline, uid))
+            except InstagramError:
+                return False
+
+    # -------------------------------------------------------------- extras
+    def highlights(self, username: str) -> list[dict]:
+        uid = self.user_id(username)
+        raw = self._call(self.cl.user_highlights, uid) or []
+        out = []
+        for h in raw:
+            items = getattr(h, "items", None) or []
+            out.append(
+                {
+                    "id": str(getattr(h, "pk", "") or getattr(h, "id", "") or ""),
+                    "title": getattr(h, "title", "") or "",
+                    "items": len(items),
+                }
+            )
+        return out
+
+    def story_viewers(self, story_pk: str) -> list[Profile]:
+        raw = self._call(self.cl.story_viewers, int(story_pk)) or []
+        return [
+            Profile(
+                user_id=str(getattr(u, "pk", "") or ""),
+                username=getattr(u, "username", "") or "",
+                full_name=getattr(u, "full_name", "") or "",
+            )
+            for u in raw
+        ]
+
+    def insights(self) -> dict:
+        raw = self._call(self.cl.insights_account) or {}
+        out: dict[str, Any] = {}
+        for key, value in (raw or {}).items():
+            if isinstance(value, (int, float, str, bool)):
+                out[key] = value
+        return out
+
+    def reels(self, username: str, amount: int = 10) -> list[Media]:
+        uid = self.user_id(username)
+        raw = self._call(self.cl.user_medias, uid, amount) or []
+        reels = [m for m in raw if int(getattr(m, "media_type", 1) or 1) == 8]
+        return [self._to_media(m) for m in reels]
+
+    def thread_messages(self, thread_id: str, amount: int = 20) -> list[Message]:
+        raw = self._call(self.cl.direct_messages, int(thread_id), amount) or []
+        out = []
+        for m in raw:
+            uid = str(getattr(m, "user_id", "") or "")
+            out.append(
+                Message(
+                    id=str(getattr(m, "id", "") or ""),
+                    thread_id=str(getattr(m, "thread_id", thread_id) or thread_id),
+                    text=getattr(m, "text", "") or "",
+                    user_id=uid,
+                    username="",
+                    timestamp=self._epoch(getattr(m, "timestamp", None)),
+                    is_self=bool(uid and uid == self.own_user_id),
+                    item_type=str(getattr(m, "item_type", "") or "text"),
+                )
+            )
+        return out
+
+    # ---------------------------------------------------------- publishing
+    def publish_photo(self, path: str, caption: str = "") -> Media | None:
+        p = Path(path).expanduser()
+        if not p.exists():
+            return None
+        try:
+            media = self._call(self.cl.photo_upload, p, caption)
+        except InstagramError:
+            return None
+        return self._to_media(media) if media is not None else None
+
+    def publish_video(self, path: str, caption: str = "") -> Media | None:
+        p = Path(path).expanduser()
+        if not p.exists():
+            return None
+        try:
+            media = self._call(self.cl.video_upload, p, caption)
+        except InstagramError:
+            return None
+        return self._to_media(media) if media is not None else None
+
+    def publish_story(self, path: str, caption: str = "") -> str:
+        p = Path(path).expanduser()
+        if not p.exists():
+            return ""
+        try:
+            story = self._call(self.cl.photo_upload_to_story, p, caption)
+        except InstagramError:
+            return ""
+        return str(getattr(story, "pk", "") or "")
 
     # -------------------------------------------------------------- status
     def health(self) -> dict[str, Any]:

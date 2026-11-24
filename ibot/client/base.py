@@ -191,6 +191,9 @@ class BaseClient:
     def send_photo(self, thread_id: str, path: str, caption: str = "") -> SendResult:
         raise NotImplementedError
 
+    def send_file(self, thread_id: str, path: str) -> SendResult:
+        raise NotImplementedError
+
     def mark_seen(self, thread_id: str) -> bool:
         raise NotImplementedError
 

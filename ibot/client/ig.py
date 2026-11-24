@@ -461,32 +461,157 @@ class ApiClient(BaseClient):
             log.warning("reels_tray type error: %s", exc)
             return found
 
-    def like_tray_stories(self) -> tuple[int, int]:
-        """Pull tray → like every active story. Returns (liked, accounts)."""
-        tray = self.stories_tray(fill_items=True)
-        liked = 0
-        for uname, stories in tray.items():
-            for s in stories:
-                if not s.pk:
-                    continue
+    def tray_media_ids(self) -> tuple[list[str], int]:
+        """ONE tray call → media ids only. No /feed/user/.../story/, no media/info."""
+        ids: list[str] = []
+        accounts = 0
+        try:
+            raw = None
+            priv = getattr(self.cl, "private_request", None)
+            reels_fn = getattr(self.cl, "reels_tray", None)
+            if callable(reels_fn):
                 try:
-                    if self.like_story(s.pk):
-                        liked += 1
+                    raw = self._call(reels_fn)
                 except Exception:
+                    raw = None
+            if raw is None and callable(priv):
+                try:
+                    raw = self._call(priv, "feed/reels_tray/")
+                except Exception:
+                    raw = None
+            if not raw:
+                return [], 0
+            tray = raw.get("tray") if isinstance(raw, dict) else getattr(raw, "tray", None)
+            if not tray:
+                return [], 0
+
+            my_id = str(getattr(self, "_own_user_id", "") or "")
+            seen: set[str] = set()
+            for item in tray:
+                if isinstance(item, dict):
+                    user = item.get("user") or {}
+                    uid = str(user.get("pk") or user.get("id") or item.get("id") or "")
+                    items = item.get("items") or []
+                    media_ids = item.get("media_ids") or []
+                else:
+                    user = getattr(item, "user", None)
+                    uid = str(getattr(user, "pk", None) or getattr(item, "id", None) or "")
+                    items = getattr(item, "items", None) or []
+                    media_ids = list(getattr(item, "media_ids", None) or [])
+
+                if my_id and uid and str(uid) == my_id:
                     continue
-        return liked, len(tray)
+
+                got = False
+                for s in items:
+                    if isinstance(s, dict):
+                        pk = str(s.get("pk") or s.get("id") or "")
+                    else:
+                        pk = str(getattr(s, "pk", None) or getattr(s, "id", None) or "")
+                    if not pk or pk in seen:
+                        continue
+                    mid = pk if "_" in pk else (f"{pk}_{uid}" if uid else pk)
+                    seen.add(pk)
+                    ids.append(mid)
+                    got = True
+                for mid in media_ids:
+                    mid = str(mid)
+                    if not mid or mid in seen:
+                        continue
+                    seen.add(mid)
+                    ids.append(mid if ("_" in mid or not uid) else f"{mid}_{uid}")
+                    got = True
+                if got:
+                    accounts += 1
+            return ids, accounts
+        except Exception as exc:
+            log.warning("tray_media_ids failed: %s", exc)
+            return [], 0
+
+    def _like_story_raw(self, media_id: str) -> bool:
+        """Like by media id only — no media/info prefetch."""
+        priv = getattr(self.cl, "private_request", None)
+        if callable(priv):
+            try:
+                uid = str(getattr(self, "_own_user_id", "") or "")
+                try:
+                    own = getattr(self, "own_user_id", None)
+                    if callable(own):
+                        uid = str(own() or uid)
+                except Exception:
+                    pass
+                data = {
+                    "media_id": str(media_id),
+                    "_uid": uid,
+                    "source_of_like": "button",
+                    "container_module": "reel_feed_timeline",
+                }
+                for attr, key in (("_uuid", "_uuid"), ("uuid", "_uuid")):
+                    val = getattr(self.cl, attr, None)
+                    if val:
+                        data[key] = str(val)
+                result = self._call(
+                    priv,
+                    "story_interactions/send_story_like",
+                    data=data,
+                    with_signature=True,
+                )
+                if isinstance(result, dict):
+                    return result.get("status", "ok") == "ok"
+                return True
+            except Exception as exc:
+                log.debug("raw story like failed for %s: %s", media_id, exc)
+        # fallback (may hit media/info)
+        like_fn = getattr(self.cl, "story_like", None)
+        if callable(like_fn):
+            try:
+                return bool(self._call(like_fn, str(media_id).split("_")[0]))
+            except Exception:
+                return False
+        return False
+
+    def _seen_stories_raw(self, media_ids: list[str]) -> bool:
+        """Batch mark-seen — no media/info."""
+        if not media_ids:
+            return False
+        pks = []
+        for mid in media_ids:
+            try:
+                pks.append(int(str(mid).split("_")[0]))
+            except (TypeError, ValueError):
+                continue
+        seen_fn = getattr(self.cl, "story_seen", None)
+        if callable(seen_fn) and pks:
+            try:
+                self._call(seen_fn, pks)
+                return True
+            except Exception:
+                pass
+        return False
+
+    def like_tray_stories(self) -> tuple[int, int]:
+        """Tray → bam likes. No per-user story fetch, no media/info."""
+        media_ids, accounts = self.tray_media_ids()
+        if not media_ids:
+            return 0, 0
+        liked = 0
+
+        def _one(mid: str) -> int:
+            return 1 if self._like_story_raw(mid) else 0
+
+        workers = min(20, max(1, len(media_ids)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for n in pool.map(_one, media_ids):
+                liked += n
+        return liked, accounts
 
     def view_tray_stories(self) -> tuple[int, int]:
-        """Pull tray → mark every active story seen. Returns (viewed, accounts)."""
-        tray = self.stories_tray(fill_items=True)
-        all_pks: list[str] = []
-        for stories in tray.values():
-            all_pks.extend(s.pk for s in stories if s.pk)
-        if all_pks:
-            # story_seen accepts batches; chunk to stay safe
-            for i in range(0, len(all_pks), 50):
-                self.view_stories(all_pks[i : i + 50])
-        return len(all_pks), len(tray)
+        """Tray → bam mark-seen. No per-user story fetch, no media/info."""
+        media_ids, accounts = self.tray_media_ids()
+        if not media_ids:
+            return 0, 0
+        ok = self._seen_stories_raw(media_ids)
+        return (len(media_ids) if ok else 0), accounts
 
     def stories_for_ids(self, people: list[tuple[str, str]]) -> dict[str, list[Story]]:
         """Fetch stories for many (user_id, username) pairs — light batch path.

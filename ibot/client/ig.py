@@ -289,6 +289,25 @@ class ApiClient(BaseClient):
             return SendResult(False, detail=str(exc))
         return SendResult(True, message_id=str(getattr(msg, "id", "") or ""), thread_id=thread_id)
 
+    def send_file(self, thread_id: str, path: str) -> SendResult:
+        """Send a document / file (JSON lists, etc.) into a DM thread."""
+        p = Path(path).expanduser()
+        if not p.exists():
+            return SendResult(False, detail=f"file not found: {path}")
+        # Prefer direct_send_file when the underlying client has it
+        try:
+            if hasattr(self.cl, "direct_send_file"):
+                msg = self._call(self.cl.direct_send_file, p, thread_ids=[int(thread_id)])
+                return SendResult(True, message_id=str(getattr(msg, "id", "") or ""), thread_id=thread_id)
+        except (InstagramError, ValueError, AttributeError):
+            pass
+        # Fallback: try photo (works for images; for .json it may fail)
+        try:
+            msg = self._call(self.cl.direct_send_photo, p, thread_ids=[int(thread_id)])
+            return SendResult(True, message_id=str(getattr(msg, "id", "") or ""), thread_id=thread_id)
+        except (InstagramError, ValueError) as exc:
+            return SendResult(False, detail=str(exc))
+
     def mark_seen(self, thread_id: str) -> bool:
         try:
             return bool(self._call(self.cl.direct_send_seen, int(thread_id)))

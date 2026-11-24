@@ -362,46 +362,113 @@ class ApiClient(BaseClient):
         uid = self.user_id(username)
         return self.stories_by_id(uid, username=username)
 
-    def stories_tray(self) -> dict[str, list[Story]]:
-        """Light path: one request for everyone who currently has a story.
+    def stories_tray(self, fill_items: bool = True) -> dict[str, list[Story]]:
+        """Pull the story tray exactly like the official app.
 
-        Uses feed/reels_tray/ — the same endpoint the official app uses.
-        Returns {username: [Story, ...]} for accounts that actually have stories.
+        1. One ``feed/reels_tray/`` call → only people who currently have stories
+        2. If tray entries have no items (common), fetch each by user id
+           (still only people with stories — not your whole following list)
+
+        Returns {username: [Story, ...]}.
         """
         found: dict[str, list[Story]] = {}
+        need_fetch: list[tuple[str, str]] = []  # (uid, username)
         try:
-            # instagrapi sometimes exposes this; otherwise hit private API directly
             raw = None
             if hasattr(self.cl, "reels_tray"):
-                raw = self._call(self.cl.reels_tray)
-            elif hasattr(self.cl, "private_request"):
+                try:
+                    raw = self._call(self.cl.reels_tray)
+                except Exception:
+                    raw = None
+            if raw is None and hasattr(self.cl, "private_request"):
                 raw = self._call(self.cl.private_request, "feed/reels_tray/")
             if not raw:
                 return found
+
             tray = raw.get("tray") if isinstance(raw, dict) else getattr(raw, "tray", None)
             if not tray:
                 return found
+
             for item in tray:
-                user = item.get("user") if isinstance(item, dict) else getattr(item, "user", None)
-                if not user:
-                    continue
-                if isinstance(user, dict):
+                if isinstance(item, dict):
+                    user = item.get("user") or {}
                     uname = str(user.get("username") or "")
-                    uid = str(user.get("pk") or user.get("id") or "")
+                    uid = str(user.get("pk") or user.get("id") or item.get("id") or "")
+                    items = item.get("items") or []
+                    media_count = int(item.get("media_count") or 0)
+                    media_ids = item.get("media_ids") or []
                 else:
-                    uname = str(getattr(user, "username", "") or "")
-                    uid = str(getattr(user, "pk", "") or "")
-                items = item.get("items") if isinstance(item, dict) else getattr(item, "items", None)
-                if not items:
-                    # tray often only lists who has stories; fetch items by id (still 1 call/user with stories)
+                    user = getattr(item, "user", None)
+                    uname = str(getattr(user, "username", "") or "") if user else ""
+                    uid = str(
+                        getattr(user, "pk", None)
+                        or getattr(item, "id", None)
+                        or ""
+                    )
+                    items = getattr(item, "items", None) or []
+                    media_count = int(getattr(item, "media_count", 0) or 0)
+                    media_ids = getattr(item, "media_ids", None) or []
+
+                if not uid and not uname:
                     continue
-                stories = [self._story_from_raw(s, uid=uid, username=uname) for s in items]
-                if stories and uname:
-                    found[uname] = stories
+                # Skip self
+                if uid and uid == self.own_user_id():
+                    continue
+
+                if items:
+                    stories = [self._story_from_raw(s, uid=uid, username=uname) for s in items]
+                    stories = [s for s in stories if s.pk]
+                    if stories:
+                        found[uname or uid] = stories
+                elif fill_items and (media_count > 0 or media_ids or True):
+                    # Tray listed them as having stories but omitted items
+                    need_fetch.append((uid, uname))
+
+            # Fill missing items — only for accounts the tray said have stories
+            if need_fetch:
+                def _fetch(pair):
+                    uid, uname = pair
+                    try:
+                        return uname or uid, self.stories_by_id(uid, username=uname)
+                    except Exception:
+                        return uname or uid, []
+
+                workers = min(12, max(1, len(need_fetch)))
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    for key, stories in pool.map(_fetch, need_fetch):
+                        if stories:
+                            found[key] = stories
             return found
         except InstagramError as exc:
-            log.debug("reels_tray failed: %s", exc)
+            log.warning("reels_tray failed: %s", exc)
             return found
+
+    def like_tray_stories(self) -> tuple[int, int]:
+        """Pull tray → like every active story. Returns (liked, accounts)."""
+        tray = self.stories_tray(fill_items=True)
+        liked = 0
+        for uname, stories in tray.items():
+            for s in stories:
+                if not s.pk:
+                    continue
+                try:
+                    if self.like_story(s.pk):
+                        liked += 1
+                except Exception:
+                    continue
+        return liked, len(tray)
+
+    def view_tray_stories(self) -> tuple[int, int]:
+        """Pull tray → mark every active story seen. Returns (viewed, accounts)."""
+        tray = self.stories_tray(fill_items=True)
+        all_pks: list[str] = []
+        for stories in tray.values():
+            all_pks.extend(s.pk for s in stories if s.pk)
+        if all_pks:
+            # story_seen accepts batches; chunk to stay safe
+            for i in range(0, len(all_pks), 50):
+                self.view_stories(all_pks[i : i + 50])
+        return len(all_pks), len(tray)
 
     def stories_for_ids(self, people: list[tuple[str, str]]) -> dict[str, list[Story]]:
         """Fetch stories for many (user_id, username) pairs — light batch path.

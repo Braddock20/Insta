@@ -28,6 +28,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -59,6 +60,7 @@ class ListResult:
     elapsed_ms: int = 0
     path: str = ""
     error: str = ""
+    errors: list[str] = field(default_factory=list)
     users: list[dict] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -71,6 +73,7 @@ class ListResult:
             "elapsed_ms": self.elapsed_ms,
             "path": self.path,
             "error": self.error,
+            "errors": list(self.errors),
         }
 
 
@@ -135,12 +138,17 @@ class BulkEngine:
     def _call(self, binary: Path, request: dict[str, Any]) -> dict[str, Any]:
         """Send one request to the Rust engine."""
         started = time.time()
+        # A whole scan is many pages, so the engine gets a generous but
+        # bounded amount of time. (The old factor of 900 on a *seconds*
+        # timeout meant five hours — a hung engine froze the bot for the
+        # rest of the day.)
+        budget = max(60.0, float(self._num("network.request_timeout", 20)) * 15)
         proc = subprocess.run(
             [str(binary)],
             input=json.dumps(request),
             capture_output=True,
             text=True,
-            timeout=float(self._num("network.request_timeout", 20)) * 900,
+            timeout=budget,
         )
         elapsed = int((time.time() - started) * 1000)
         if proc.returncode != 0:
@@ -155,32 +163,74 @@ class BulkEngine:
         return payload
 
     # -------------------------------------------------------------- session
+    def _cookies(self, client) -> dict[str, str]:
+        """The cookie jar of the live client.
+
+        ``cookie_dict`` is the jar the client itself talks with — it is the
+        only place the cookies really are. (``session_dict`` does not exist
+        in instagrapi at all, and even where it does it holds the device
+        identity, not the cookies.)
+        """
+        out: dict[str, str] = {}
+        try:
+            jar = getattr(client, "cookie_dict", None)
+            if isinstance(jar, dict):
+                out.update({str(k): str(v) for k, v in jar.items()})
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            auth = getattr(client, "authorization_data", None) or {}
+            if isinstance(auth, dict):
+                for name in ("sessionid", "csrftoken", "ds_user_id"):
+                    value = auth.get(name)
+                    if value:
+                        out.setdefault(name, str(value))
+        except Exception:  # noqa: BLE001
+            pass
+        for name, getter in (("sessionid", "sessionid"), ("csrftoken", "token")):
+            if out.get(name):
+                continue
+            try:
+                value = getattr(client, getter, "") or ""
+            except Exception:  # noqa: BLE001
+                value = ""
+            if value:
+                out[name] = str(value)
+        return out
+
     def session(self) -> dict[str, Any]:
         """The credentials the Rust engine needs, taken from the live client."""
         client = getattr(self.client, "cl", None)
         if client is None:
             return {}
-        cookies: dict[str, str] = {}
+        cookies = self._cookies(client)
         claim = ""
         try:
-            data = client.session_dict or {}
-            cookies = dict(data.get("cookies") or {})
-            claim = str(data.get("ig_www_claim") or "")
+            claim = str(getattr(client, "ig_www_claim", "") or "")
         except Exception:  # noqa: BLE001
-            data = {}
+            claim = ""
         app_id = ""
         user_agent = ""
         try:
             settings = getattr(client, "settings", {}) or {}
-            app_id = str(settings.get("app_id") or "")
             user_agent = str(settings.get("user_agent") or "")
         except Exception:  # noqa: BLE001
             pass
         if not user_agent:
             user_agent = str(getattr(getattr(client, "private", None), "user_agent", "") or "")
+        try:
+            app_id = str(getattr(client, "app_id", "") or "")
+        except Exception:  # noqa: BLE001
+            app_id = ""
         if not app_id:
-            app_id = str(getattr(client, "app_id", "") or DEFAULT_APP_ID)
-        cookie = "; ".join(f"{k}={v}" for k, v in cookies.items())
+            app_id = DEFAULT_APP_ID
+        # Only the two cookies the private API needs are sent. The whole jar
+        # is not safe to hand over: ``ds_user_id`` makes Instagram answer
+        # HTTP 403 ("something went wrong") on the friendships endpoints, and
+        # the engine does not need it.
+        cookie = "; ".join(
+            f"{name}={cookies[name]}" for name in ("sessionid", "csrftoken") if cookies.get(name)
+        )
         proxy = str(self.cfg.get("network.proxy", "") if self.cfg else "") or ""
         return {
             "sessionid": cookies.get("sessionid", ""),
@@ -191,6 +241,16 @@ class BulkEngine:
             "cookie": cookie,
             "proxy": proxy,
         }
+
+    def _rust_ready(self) -> bool:
+        """Can the Rust engine authenticate at all?
+
+        Without a sessionid the binary walks into Instagram as a stranger and
+        comes back with HTTP 401 and an empty list — which looks exactly like
+        an account with no followers. So it is checked *before* the binary is
+        allowed to answer, not after.
+        """
+        return bool(self.session().get("sessionid"))
 
     # -------------------------------------------------------------- listing
     def list_connections(
@@ -210,11 +270,28 @@ class BulkEngine:
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
         if self.engine() == "rust":
+            if not self._rust_ready():
+                log.warning("the Rust engine has no session — using Python")
+                return self._list_python(kind, user_id, out_path, limit)
             result = self._list_rust(kind, user_id, out_path, limit)
             if result.ok:
                 return result
             log.warning("the Rust engine failed (%s) — using Python", result.error)
 
+        return self._list_python(kind, user_id, out_path, limit)
+
+    def list_connections_python(
+        self,
+        kind: str,
+        user_id: str,
+        out: str | Path | None = None,
+        limit: int = 0,
+    ) -> ListResult:
+        """The same walk, done with instagrapi — the reference implementation."""
+        kind = "following" if kind.startswith("follow") and kind.endswith("ing") else "followers"
+        out_path = Path(out) if out else None
+        if out_path is not None:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
         return self._list_python(kind, user_id, out_path, limit)
 
     # -- rust
@@ -228,6 +305,17 @@ class BulkEngine:
         binary = self.binary()
         if binary is None:
             return ListResult(ok=False, engine="rust", error="the binary is not built")
+
+        # The engine hands the list back through a file — it never builds a
+        # Python object for it. So when the caller did not ask for a file,
+        # a temporary one is written and read back afterwards. Without this
+        # the count was right and the list was empty, which is how
+        # ``/following`` and ``/storiesall`` answered "not following anyone".
+        temp_dir: Path | None = None
+        if out_path is None:
+            temp_dir = Path(tempfile.mkdtemp(prefix="igfast-"))
+            out_path = temp_dir / f"{kind}.jsonl"
+
         request = {
             "op": "list_followers" if kind == "followers" else "list_following",
             "user_id": str(user_id),
@@ -243,29 +331,40 @@ class BulkEngine:
             page = max(1, self._num("speed.page_size", 200))
             request["max_pages"] = -(-limit // page) + 1
         try:
-            payload = self._call(binary, request)
-        except Exception as exc:  # noqa: BLE001
-            return ListResult(ok=False, engine="rust", error=str(exc))
-        if not payload.get("ok"):
-            return ListResult(
-                ok=False, engine="rust", error=str(payload.get("error") or "the engine said no")
+            try:
+                payload = self._call(binary, request)
+            except Exception as exc:  # noqa: BLE001
+                return ListResult(ok=False, engine="rust", error=str(exc))
+            if not payload.get("ok"):
+                return ListResult(
+                    ok=False,
+                    engine="rust",
+                    error=str(payload.get("error") or "the engine said no"),
+                )
+            errors = [str(e) for e in (payload.get("errors") or []) if str(e).strip()]
+            if errors:
+                # A failed walk is not an empty list. Report it, so the Python
+                # engine can take over instead of the bot believing a zero.
+                return ListResult(ok=False, engine="rust", error=errors[0], errors=errors)
+            result = ListResult(
+                ok=True,
+                engine="rust",
+                kind=kind,
+                count=int(payload.get("count") or 0),
+                pages=int(payload.get("pages") or 0),
+                elapsed_ms=int(payload.get("elapsed_ms") or 0),
+                path=str(out_path) if out_path else "",
             )
-        result = ListResult(
-            ok=True,
-            engine="rust",
-            kind=kind,
-            count=int(payload.get("count") or 0),
-            pages=int(payload.get("pages") or 0),
-            elapsed_ms=int(payload.get("elapsed_ms") or 0),
-            path=str(out_path) if out_path else "",
-        )
-        if out_path and out_path.exists():
-            result.users = read_jsonl(out_path)
-            result.count = len(result.users) or result.count
-        if limit and result.count > limit:
-            result.users = result.users[:limit]
-            result.count = len(result.users)
-        return result
+            if out_path and out_path.exists():
+                result.users = read_jsonl(out_path)
+                result.count = len(result.users) or result.count
+            if limit and result.count > limit:
+                result.users = result.users[:limit]
+                result.count = len(result.users)
+            return result
+        finally:
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     # -- python
     def _list_python(
@@ -562,6 +661,24 @@ class Scanner:
         summary["elapsed_ms"] = int((time.time() - started) * 1000)
         return summary
 
+    def _expected_counts(self, kinds: tuple[str, ...]) -> dict[str, int]:
+        """How many followers/following the profile says there are.
+
+        It is the cross-check for the lists: an account that shows 496
+        followers on its profile and zero in the list is a broken read, not
+        an empty follower list.
+        """
+        try:
+            me = self.client.whoami()
+        except Exception:  # noqa: BLE001
+            return {}
+        out: dict[str, int] = {}
+        if "followers" in kinds:
+            out["followers"] = int(getattr(me, "follower_count", 0) or 0)
+        if "following" in kinds:
+            out["following"] = int(getattr(me, "following_count", 0) or 0)
+        return out
+
     def _walk(
         self,
         kinds: tuple[str, ...],
@@ -581,9 +698,29 @@ class Scanner:
             "elapsed_ms": 0,
         }
 
+        expected = self._expected_counts(kinds)
+
         for kind in kinds:
             path = folder / f"{kind}.jsonl"
             result = self.engine.list_connections(kind, user_id, out=path, limit=0)
+            if result.ok and result.count == 0 and expected.get(kind, 0) > 0:
+                # An empty list from an account that has followers is not an
+                # answer, it is a failure. The other engine gets a turn
+                # before the bot tells anybody that there are zero.
+                log.warning(
+                    "the %s list came back empty and the profile says %s — trying Python",
+                    kind,
+                    expected[kind],
+                )
+                fallback = self.engine.list_connections_python(kind, user_id, out=path, limit=0)
+                if fallback.count > 0:
+                    result = fallback
+                elif not fallback.ok:
+                    result = fallback
+                else:
+                    summary.setdefault("warnings", []).append(
+                        f"the {kind} list came back empty although the profile says {expected[kind]}"
+                    )
             summary["lists"][kind] = result.as_dict()
             if not result.ok:
                 summary["ok"] = False

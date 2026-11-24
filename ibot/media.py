@@ -17,6 +17,7 @@ with a DM if you want it to, but there is nothing to like.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from . import log
 from .client.base import Story
@@ -34,11 +35,12 @@ AUTO_ACTIONS = (
 class MediaBot:
     """Runs the automatic visible actions."""
 
-    def __init__(self, client, cfg, store, guardrails):
+    def __init__(self, client, cfg, store, guardrails, risk=None):
         self.client = client
         self.cfg = cfg
         self.store = store
         self.guardrails = guardrails
+        self.risk = risk
 
     # ------------------------------------------------------------- helpers
     def _enabled(self, name: str, default: bool = False) -> bool:
@@ -176,10 +178,163 @@ class MediaBot:
             self.store.record_activity("note", note.username, note.text[:120], fingerprint=note.id)
         return notes
 
+    # ------------------------------------------------------------- welcome
+    def auto_welcome_new_followers(self) -> int:
+        """Say hello to the accounts that started following you.
+
+        A DM to a new follower is the oldest trick in the book, and it is
+        also the fastest way to look automated — everybody who follows gets
+        the same message. So the message is templated, the delay is long
+        and random, the budget is tiny, and the same text is never sent
+        twice.
+        """
+        if not self._enabled("welcome"):
+            return 0
+        template = str(self.cfg.get("automations.welcome_message", "") or "").strip()
+        if not template:
+            return 0
+
+        me = self.client.whoami()
+        try:
+            followers = {p.username for p in self.client.followers(me.username, amount=50)}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not read the followers: %s", exc)
+            return 0
+
+        known_raw = self.store.kv_get("auto:followers")
+        known = set((known_raw or "").split(",")) if known_raw else set()
+        if not known:
+            # The first run only records who is already there.
+            self.store.kv_set("auto:followers", ",".join(sorted(followers)))
+            log.info("recorded %d followers for the welcome check", len(followers))
+            return 0
+
+        fresh = sorted(followers - known)
+        self.store.kv_set("auto:followers", ",".join(sorted(followers)))
+        if not fresh:
+            return 0
+
+        count = 0
+        for name in fresh:
+            if self.risk is not None:
+                decision = self.risk.check_visible("welcome", target=name, text=template)
+                if not decision.allowed:
+                    log.info("no welcome for @%s: %s", name, decision.reason)
+                    continue
+            text = template.replace("{username}", name).replace("{name}", name)
+            sent = self.client.send_to_user(name, text)
+            if sent.ok:
+                count += 1
+                if self.risk is not None:
+                    self.risk.record_visible("welcome", target=name, detail="new follower")
+                log.info("welcomed @%s", name)
+            time.sleep(2.0)
+        return count
+
+    # ------------------------------------------------------------ comments
+    def auto_answer_comments(self) -> int:
+        """Answer new comments on your own posts.
+
+        Only comments that have not been answered before are touched, and
+        the answer comes from a template with a rotating opening so the
+        replies do not read like a form letter.
+        """
+        if not self._enabled("comment"):
+            return 0
+        template = str(self.cfg.get("automations.comment_message", "") or "").strip()
+        if not template:
+            return 0
+
+        me = self.client.whoami()
+        posts = self.client.user_posts(me.username, amount=int(self.cfg.get("automations.comment_posts", 3) or 3))
+        count = 0
+        for post in posts:
+            try:
+                comments = self.client.comments(post.pk, amount=10)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("could not read the comments of %s: %s", post.pk, exc)
+                continue
+            for comment in comments:
+                if comment.user_id == self.client.own_user_id:
+                    continue
+                fingerprint = f"comment:{comment.pk}"
+                if not self.store.record_activity("comment", comment.username, fingerprint=fingerprint):
+                    continue
+                if self.risk is not None:
+                    decision = self.risk.check_visible("comment", target=comment.username)
+                    if not decision.allowed:
+                        continue
+                text = template.replace("{username}", comment.username).replace("{name}", comment.username)
+                done = self.client.comment(post.pk, text)
+                if done:
+                    count += 1
+                    if self.risk is not None:
+                        self.risk.record_visible("comment", target=comment.username, detail=post.pk)
+                    log.info("answered a comment from @%s", comment.username)
+                time.sleep(3.0)
+        return count
+
+    # -------------------------------------------------------------- stories
+    def auto_publish_story(self) -> int:
+        """Publish the next file from the story folder as a story.
+
+        Files are used in order and the name is remembered, so a restart
+        does not publish the same photo twice.
+        """
+        if not self._enabled("storypost"):
+            return 0
+        folder = str(self.cfg.get("automations.story_folder", "") or "")
+        if not folder:
+            return 0
+        root = Path(folder).expanduser()
+        if not root.is_absolute():
+            root = Path(str(self.cfg.root)) / root
+        if not root.is_dir():
+            log.warning("the story folder %s does not exist", root)
+            return 0
+
+        files = sorted(
+            p for p in root.iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+        )
+        if not files:
+            return 0
+
+        last = self.store.kv_get("auto:story_last", "")
+        index = 0
+        if last in [f.name for f in files]:
+            index = [f.name for f in files].index(last) + 1
+            if index >= len(files):
+                index = 0
+        target = files[index]
+
+        if self.risk is not None:
+            decision = self.risk.check_visible("story_post", target=target.name)
+            if not decision.allowed:
+                log.info("no story published: %s", decision.reason)
+                return 0
+
+        caption = str(self.cfg.get("automations.story_caption", "") or "")
+        pk = self.client.publish_story(str(target), caption)
+        if not pk:
+            return 0
+        self.store.kv_set("auto:story_last", target.name)
+        if self.risk is not None:
+            self.risk.record_visible("story_post", target=target.name, detail=pk)
+        log.info("published the story %s (%s)", target.name, pk)
+        return 1
+
     # ----------------------------------------------------------------- run
     def run_once(self) -> dict:
         """Run every enabled automatic action once."""
-        summary = {"stories_viewed": 0, "stories_liked": 0, "posts_liked": 0, "followed_back": 0}
+        summary = {
+            "stories_viewed": 0,
+            "stories_liked": 0,
+            "posts_liked": 0,
+            "followed_back": 0,
+            "welcomed": 0,
+            "comments_answered": 0,
+            "stories_published": 0,
+        }
         try:
             summary["stories_viewed"] = self.auto_view_stories()
         except Exception as exc:  # noqa: BLE001
@@ -200,4 +355,16 @@ class MediaBot:
             self.auto_read_notes()
         except Exception as exc:  # noqa: BLE001
             log.warning("auto read notes failed: %s", exc)
+        try:
+            summary["welcomed"] = self.auto_welcome_new_followers()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("auto welcome failed: %s", exc)
+        try:
+            summary["comments_answered"] = self.auto_answer_comments()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("auto answer comments failed: %s", exc)
+        try:
+            summary["stories_published"] = self.auto_publish_story()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("auto publish story failed: %s", exc)
         return summary

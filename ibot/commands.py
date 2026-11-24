@@ -35,13 +35,27 @@ class CommandError(RuntimeError):
 class CommandRouter:
     """Parses and runs commands sent to the bot."""
 
-    def __init__(self, client, cfg, store=None, guardrails=None, session=None, media=None):
+    def __init__(
+        self,
+        client,
+        cfg,
+        store=None,
+        guardrails=None,
+        session=None,
+        media=None,
+        risk=None,
+        protocol=None,
+        realtime=None,
+    ):
         self.client = client
         self.cfg = cfg
         self.store = store
         self.guardrails = guardrails
         self.session = session
         self.media = media
+        self.risk = risk
+        self.protocol = protocol
+        self.realtime = realtime
         self.started_at = time.time()
         self._commands: dict[str, tuple[str, Callable[[list[str], Thread], str]]] = {}
         self._register_all()
@@ -117,6 +131,10 @@ class CommandRouter:
         self._register_people()
         self._register_notes()
         self._register_automation()
+        self._register_ops()
+        self._register_moderation()
+        self._register_discovery()
+        self._register_publishing()
 
     # ----------------------------------------------------------------- meta
     def _register_meta(self) -> None:
@@ -124,12 +142,15 @@ class CommandRouter:
         def _help(args, thread):
             groups = [
                 ("Basics", ["help", "whoami", "status", "health", "relogin", "ping", "uptime", "about", "version"]),
-                ("Inbox", ["inbox", "threads", "unread", "last", "requests", "accept", "reply", "send", "react", "clear"]),
-                ("Stories", ["stories", "storyview", "storylike", "storyreply"]),
-                ("Posts", ["post", "like", "unlike", "comments", "comment", "feed"]),
-                ("People", ["profile", "follow", "unfollow", "followers", "following", "followback"]),
+                ("Inbox", ["inbox", "threads", "unread", "last", "requests", "accept", "reply", "send", "react", "clear", "dms", "dmsearch"]),
+                ("Stories", ["stories", "storyview", "storylike", "storyreply", "viewers", "highlights"]),
+                ("Posts", ["post", "like", "unlike", "comments", "comment", "feed", "reels"]),
+                ("People", ["profile", "follow", "unfollow", "followers", "following", "followback", "mutuals", "search"]),
                 ("Notes", ["notes", "note"]),
-                ("Automation", ["auto", "autolike", "autoview", "autostory", "autofollow", "autocomment", "autonote"]),
+                ("Moderation", ["block", "unblock", "muteposts", "unmuteposts", "mutestories", "unmutestories", "archive", "mute", "unmute", "followrequests", "approve", "decline"]),
+                ("Publishing", ["postphoto", "postvideo", "storypost"]),
+                ("Automation", ["auto", "autolike", "autoview", "autostory", "autofollow", "autocomment", "autonote", "autowelcome", "autostorypost"]),
+                ("Safety", ["risk", "quiet", "pause", "resume", "protocol", "protocolprobe", "realtime", "backup"]),
                 ("Limits", ["stats", "caps", "tasks", "cancel"]),
             ]
             lines = ["InstaBaileys — commands you can send to yourself:", ""]
@@ -500,8 +521,10 @@ class CommandRouter:
             ("view", "autoview", "view the stories of the people you follow"),
             ("story", "autostory", "like the stories of the people you follow"),
             ("follow", "autofollow", "follow back new followers"),
-            ("comment", "autocomment", "reply to comments on your posts"),
+            ("comment", "autocomment", "answer comments on your posts"),
             ("note", "autonote", "read the notes that arrive"),
+            ("welcome", "autowelcome", "say hello to new followers"),
+            ("storypost", "autostorypost", "publish a story from the story folder"),
         ]
 
         @self.register("auto", "show or set the automatic actions: /auto <name> on|off")
@@ -570,3 +593,279 @@ class CommandRouter:
                 return "no store attached"
             ok = self.store.cancel_task(int(args[0]))
             return "✅ cancelled" if ok else "❌ no such task"
+
+    # ------------------------------------------------------------------ ops
+    def _register_ops(self) -> None:
+        @self.register("risk", "the risk dashboard: budget, safe mode, warm-up")
+        def _risk(args, thread):
+            if self.risk is None:
+                return "the risk guard is not attached"
+            s = self.risk.score()
+            lines = [
+                f"safe mode     : {'ON — ' + s['safe_reason'] if s['safe_mode'] else 'off'}",
+                f"visible today : {s['visible_today']}/{s['daily_ceiling']} "
+                f"(full ceiling {s['full_ceiling']})",
+                f"warm-up       : ×{s['warmup_factor']} (day {s['account_age_days']})",
+                f"requests      : {s['requests_this_hour']}/{s['request_budget']} per hour",
+                f"burst         : {s['burst_used']}/{s['burst_limit']} "
+                f"in {self.risk.burst_window // 60} min",
+                f"gap           : {int(s['gap_seconds'][0])}–{int(s['gap_seconds'][1])}s between actions",
+                f"de-duplicate  : {s['dedupe_hours']}h",
+                f"breaches      : {s['breaches']}",
+            ]
+            return "\n".join(lines)
+
+        @self.register("protocol", "which app identity the bot is wearing")
+        def _protocol(args, thread):
+            if self.protocol is None:
+                return "the protocol manager is not attached"
+            state = self.protocol.state
+            return (
+                f"app id        : {state.identity.app_id}\n"
+                f"version       : {state.identity.version} ({state.identity.version_code})\n"
+                f"device        : {state.identity.manufacturer} {state.identity.model}\n"
+                f"working       : {state.working} — {state.detail}"
+            )
+
+        @self.register("protocolprobe", "test every known app identity")
+        def _protocol_probe(args, thread):
+            if self.protocol is None:
+                return "the protocol manager is not attached"
+            results = self.protocol.probe(self.client)
+            lines = []
+            for r in results:
+                mark = "✅" if r["ok"] else "❌"
+                lines.append(f"{mark} {r['version']} ({r['app_id']}) — {r['detail']} [{r['ms']} ms]")
+            return "\n".join(lines)
+
+        @self.register("realtime", "the push channel: connected, messages, reconnects")
+        def _realtime(args, thread):
+            if self.realtime is None:
+                return "the push channel is not attached"
+            h = self.realtime.health()
+            return "\n".join(f"{k}: {v}" for k, v in h.items())
+
+        @self.register("quiet", "no visible actions for a while: /quiet <minutes>")
+        def _quiet(args, thread):
+            if self.store is None:
+                return "no store attached"
+            minutes = int(args[0]) if args and args[0].isdigit() else 60
+            until = time.time() + minutes * 60
+            self.store.kv_set("quiet_until", str(until))
+            return f"🤫 no visible actions for {minutes} minutes"
+
+        @self.register("backup", "copy the state and the session into backups/")
+        def _backup(args, thread):
+            if self.store is None:
+                return "no store attached"
+            import shutil
+            from pathlib import Path as _Path
+
+            root = _Path(str(self.cfg.root))
+            target = root / "backups"
+            target.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            out = []
+            for name in ("state/igbot.db", "state/session.json", "state/protocol.json"):
+                src = root / name
+                if src.exists():
+                    dest = target / f"{stamp}-{_Path(name).name}"
+                    shutil.copy2(src, dest)
+                    out.append(dest.name)
+            if not out:
+                return "nothing to back up yet"
+            return "✅ backed up: " + ", ".join(out)
+
+        @self.register("pause", "stop answering for an hour")
+        def _pause(args, thread):
+            return self.run("/quiet 60", thread)
+
+        @self.register("resume", "start answering again")
+        def _resume(args, thread):
+            if self.store is None:
+                return "no store attached"
+            self.store.kv_set("quiet_until", "0")
+            if self.risk is not None:
+                self.risk.reset()
+            return "✅ the bot is active again"
+
+    # ---------------------------------------------------------- moderation
+    def _register_moderation(self) -> None:
+        @self.register("block", "block an account")
+        def _block(args, thread):
+            user = self._target_user(args)
+            ok = self.client.block(user)
+            return f"🚫 blocked @{user}" if ok else f"❌ could not block @{user}"
+
+        @self.register("unblock", "unblock an account")
+        def _unblock(args, thread):
+            user = self._target_user(args)
+            ok = self.client.unblock(user)
+            return f"✅ unblocked @{user}" if ok else f"❌ could not unblock @{user}"
+
+        @self.register("muteposts", "stop seeing an account's posts")
+        def _muteposts(args, thread):
+            user = self._target_user(args)
+            ok = self.client.mute_posts(user)
+            return f"🔇 @{user}'s posts are muted" if ok else "❌ could not mute"
+
+        @self.register("unmuteposts", "see an account's posts again")
+        def _unmuteposts(args, thread):
+            user = self._target_user(args)
+            ok = self.client.unmute_posts(user)
+            return f"🔊 @{user}'s posts are back" if ok else "❌ could not unmute"
+
+        @self.register("mutestories", "stop seeing an account's stories")
+        def _mutestories(args, thread):
+            user = self._target_user(args)
+            ok = self.client.mute_stories(user)
+            return f"🔇 @{user}'s stories are muted" if ok else "❌ could not mute"
+
+        @self.register("unmutestories", "see an account's stories again")
+        def _unmutestories(args, thread):
+            user = self._target_user(args)
+            ok = self.client.unmute_stories(user)
+            return f"🔊 @{user}'s stories are back" if ok else "❌ could not unmute"
+
+        @self.register("archive", "hide a conversation from the inbox")
+        def _archive(args, thread):
+            if not args:
+                raise CommandError("which conversation? /threads lists the ids")
+            ok = self.client.archive_thread(args[0])
+            return "📦 archived" if ok else "❌ could not archive it"
+
+        @self.register("mute", "mute a conversation")
+        def _mute(args, thread):
+            if not args:
+                raise CommandError("which conversation? /threads lists the ids")
+            ok = self.client.mute_thread(args[0])
+            return "🔇 muted" if ok else "❌ could not mute it"
+
+        @self.register("unmute", "unmute a conversation")
+        def _unmute(args, thread):
+            if not args:
+                raise CommandError("which conversation? /threads lists the ids")
+            ok = self.client.unmute_thread(args[0])
+            return "🔊 unmuted" if ok else "❌ could not unmute it"
+
+        @self.register("followrequests", "the accounts waiting to follow you")
+        def _followrequests(args, thread):
+            people = self.client.follow_requests(amount=20)
+            if not people:
+                return "nobody is waiting"
+            return "\n".join(f"@{p.username}" for p in people)
+
+        @self.register("approve", "accept a follow request: /approve @user")
+        def _approve(args, thread):
+            user = self._target_user(args)
+            ok = self.client.approve_follow_request(user)
+            return f"✅ @{user} can follow you now" if ok else f"❌ could not approve @{user}"
+
+        @self.register("decline", "refuse a follow request: /decline @user")
+        def _decline(args, thread):
+            user = self._target_user(args)
+            ok = self.client.decline_follow_request(user)
+            return f"✅ refused @{user}" if ok else f"❌ could not decline @{user}"
+
+    # ----------------------------------------------------------- discovery
+    def _register_discovery(self) -> None:
+        @self.register("search", "find an account by name")
+        def _search(args, thread):
+            if not args:
+                raise CommandError("what should I look for?")
+            query = " ".join(args)
+            people = self.client.search_users(query, amount=10)
+            if not people:
+                return f"nobody found for {query!r}"
+            return "\n".join(f"@{p.username} — {p.full_name}" for p in people)
+
+        @self.register("dmsearch", "search inside the conversations")
+        def _dmsearch(args, thread):
+            if not args:
+                raise CommandError("what should I look for?")
+            query = " ".join(args).lower()
+            found = []
+            for t in self.client.threads(amount=30):
+                for m in t.messages:
+                    if query in (m.text or "").lower():
+                        found.append(f"{t.peer}: {self._short(m.text, 70)}")
+                        break
+            return "\n".join(found[:15]) or "nothing found"
+
+        @self.register("dms", "read a conversation: /dms <thread id>")
+        def _dms(args, thread):
+            if not args:
+                raise CommandError("which conversation? /threads lists the ids")
+            messages = self.client.thread_messages(args[0], amount=20)
+            if not messages:
+                return "no messages"
+            return "\n".join(
+                f"  {'me' if m.is_self else (m.username or 'them')}: {self._short(m.text, 100)}"
+                for m in messages
+            )
+
+        @self.register("mutuals", "who follows you and you follow back")
+        def _mutuals(args, thread):
+            me = self.client.whoami()
+            followers = {p.username for p in self.client.followers(me.username, amount=100)}
+            following = {p.username for p in self.client.following(me.username, amount=100)}
+            both = sorted(followers & following)
+            return "\n".join(f"@{n}" for n in both) or "no mutual followers"
+
+        @self.register("reels", "the reels of an account: /reels [user]")
+        def _reels(args, thread):
+            user = args[0].lstrip("@") if args else self.client.whoami().username
+            reels = self.client.reels(user, amount=10)
+            if not reels:
+                return f"@{user} has no reels"
+            return "\n".join(f"{r.pk} · ❤️ {r.like_count} · {self._short(r.caption, 50)}" for r in reels)
+
+        @self.register("highlights", "the highlights of an account")
+        def _highlights(args, thread):
+            user = args[0].lstrip("@") if args else self.client.whoami().username
+            items = self.client.highlights(user)
+            if not items:
+                return f"@{user} has no highlights"
+            return "\n".join(f"{h['id']} · {h['title']} ({h['items']} items)" for h in items)
+
+        @self.register("viewers", "who saw a story: /viewers <story id>")
+        def _viewers(args, thread):
+            if not args:
+                raise CommandError("which story? /stories gives the ids")
+            people = self.client.story_viewers(args[0])
+            if not people:
+                return "no viewers, or the list is not visible"
+            return "\n".join(f"@{p.username}" for p in people)
+
+        @self.register("insights", "the account's numbers (business accounts)")
+        def _insights(args, thread):
+            data = self.client.insights()
+            if not data:
+                return "no insights for this account"
+            return "\n".join(f"{k}: {v}" for k, v in list(data.items())[:15])
+
+    # ---------------------------------------------------------- publishing
+    def _register_publishing(self) -> None:
+        @self.register("postphoto", "publish a photo: /postphoto <file> [caption]")
+        def _postphoto(args, thread):
+            if not args:
+                raise CommandError("usage: /postphoto <file> [caption]")
+            caption = " ".join(args[1:])
+            media = self.client.publish_photo(args[0], caption)
+            return f"✅ posted {media.url}" if media else "❌ the upload failed"
+
+        @self.register("postvideo", "publish a video: /postvideo <file> [caption]")
+        def _postvideo(args, thread):
+            if not args:
+                raise CommandError("usage: /postvideo <file> [caption]")
+            caption = " ".join(args[1:])
+            media = self.client.publish_video(args[0], caption)
+            return f"✅ posted {media.url}" if media else "❌ the upload failed"
+
+        @self.register("storypost", "publish a story: /storypost <file> [caption]")
+        def _storypost(args, thread):
+            if not args:
+                raise CommandError("usage: /storypost <file> [caption]")
+            caption = " ".join(args[1:])
+            pk = self.client.publish_story(args[0], caption)
+            return f"✅ story {pk} published" if pk else "❌ the upload failed"

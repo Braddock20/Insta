@@ -400,8 +400,24 @@ class DMBot:
             answer = f"❌ that command failed: {exc}"
         with result.lock:
             result.commands += 1
-        if answer:
-            self.client.send_text(thread.id, self._decorate(answer))
+        if not answer:
+            return
+        # Support CommandResult (text + optional JSON/file attachments)
+        text = answer
+        files: list[str] = []
+        if hasattr(answer, "text"):
+            text = getattr(answer, "text", "") or ""
+            files = list(getattr(answer, "files", None) or [])
+        if text:
+            self.client.send_text(thread.id, self._decorate(str(text)))
+        for path in files:
+            try:
+                if hasattr(self.client, "send_file"):
+                    self.client.send_file(thread.id, path)
+                elif hasattr(self.client, "send_photo"):
+                    self.client.send_photo(thread.id, path)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not attach file %s: %s", path, exc)
 
     # --------------------------------------------------------------- replies
     def _choose_reply(self, text: str) -> tuple[str, str]:

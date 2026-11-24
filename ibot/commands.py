@@ -546,54 +546,74 @@ class CommandRouter:
                     break
             return f"✅ liked {liked} of {len(stories)} stories from @{user}"
 
-        @self.register("storiesall", "like the stories of everybody you follow")
+        @self.register("storiesall", "like active stories (light tray path)")
         def _storiesall(args, thread):
-            me = self.client.whoami()
-            people = self.client.connections("following", me.username, 0)
-            found = self._parallel(people, lambda p: (p, self.client.stories(p.username)))
+            # Light path: tray (1 req) → else batch by pk. Never N usernameinfo calls.
+            found: dict = {}
+            if hasattr(self.client, "stories_tray"):
+                found = self.client.stories_tray() or {}
+            if not found:
+                me = self.client.whoami()
+                people = self.client.connections("following", me.username, 0)
+                pairs = [
+                    (str(getattr(p, "user_id", "") or ""), p.username)
+                    for p in people
+                    if getattr(p, "user_id", None)
+                ]
+                if hasattr(self.client, "stories_for_ids"):
+                    found = self.client.stories_for_ids(pairs)
             total = 0
             lines = []
-            for item in found:
-                if not item:
-                    continue
-                person, stories = item
-                if not stories:
-                    continue
+            for uname, stories in found.items():
                 liked = 0
                 for story in stories:
-                    if self._allowed("story_like", person.username):
+                    if self._allowed("story_like", uname):
                         if self.client.like_story(story.pk):
                             liked += 1
                             if self.guardrails is not None:
                                 self.guardrails.record_action(
-                                    "story_like", target=person.username, detail=story.pk
+                                    "story_like", target=uname, detail=story.pk
                                 )
                     else:
                         break
                 if liked:
                     total += liked
-                    lines.append(f"@{person.username}: {liked}")
-            return f"✅ liked {total} stories\n" + "\n".join(lines[:40])
+                    lines.append(f"@{uname}: {liked}")
+            return f"✅ liked {total} stories from {len(found)} accounts\n" + "\n".join(lines[:40])
 
-        @self.register("viewall", "view the stories of everybody you follow")
+        @self.register("viewall", "view active stories (light tray path)")
         def _viewall(args, thread):
-            me = self.client.whoami()
-            people = self.client.connections("following", me.username, 0)
-            found = self._parallel(people, lambda p: (p, self.client.stories(p.username)))
-            total = 0
-            for item in found:
-                if not item:
+            # Light path: tray / batch by pk — never one usernameinfo per follow
+            found: dict = {}
+            if hasattr(self.client, "stories_tray"):
+                found = self.client.stories_tray() or {}
+            if not found:
+                me = self.client.whoami()
+                people = self.client.connections("following", me.username, 0)
+                pairs = [
+                    (str(getattr(p, "user_id", "") or ""), p.username)
+                    for p in people
+                    if getattr(p, "user_id", None)
+                ]
+                if hasattr(self.client, "stories_for_ids"):
+                    found = self.client.stories_for_ids(pairs)
+            all_pks: list[str] = []
+            for uname, stories in found.items():
+                pks = [s.pk for s in stories if s.pk]
+                if not pks:
                     continue
-                person, stories = item
-                if not stories:
-                    continue
-                if self.client.view_stories([s.pk for s in stories]):
-                    total += len(stories)
-                    if self.guardrails is not None:
-                        self.guardrails.record_action(
-                            "story_view", target=person.username, detail=f"{len(stories)} stories"
-                        )
-            return f"✅ viewed {total} stories from {len(people)} accounts"
+                all_pks.extend(pks)
+                if self.guardrails is not None:
+                    self.guardrails.record_action(
+                        "story_view", target=uname, detail=f"{len(pks)} stories"
+                    )
+            if all_pks:
+                self.client.view_stories(all_pks)
+            return (
+                f"✅ viewed {len(all_pks)} stories from {len(found)} accounts"
+                if all_pks
+                else "no active stories right now"
+            )
 
         @self.register("storyreply", "reply to a story as a DM: /storyreply <user> <text>")
         def _storyreply(args, thread):
@@ -803,16 +823,23 @@ class CommandRouter:
                 lines.append(f"… and {len(rows) - limit} more")
             return self._with_json("\n".join(lines), names, "fans")
 
-        @self.register("unfollowers", "unfollow the people who do not follow back (instant). Add 'dry' to only preview.")
+        @self.register("unfollowers", "unfollow every non-follower now. Add 'dry' to only preview.")
         def _unfollowers(args, thread):
-            """Remove the non-followers immediately.
+            """Remove every non-follower.
 
-            By default this *does* the unfollows. Pass ``dry`` / ``rehearse`` /
-            ``preview`` if you only want to see the list first.
+            Forces a fresh scan so the list is accurate, then unfollows each
+            one. No daily "already done" skips and no hourly/daily caps —
+            this is an explicit cleanup order.
             """
+            # 1. Always refresh the graph so the list is current
+            try:
+                self.scanner.scan(kinds=("followers", "following"))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("pre-unfollow scan failed (using last graph): %s", exc)
+
             rows = self._graph("nonfollowers")
             if not rows:
-                return "there is nobody to remove"
+                return "there is nobody to remove — graph is clean"
 
             limit = self._limit(args[:1], default=int(self.cfg.get("unfollow.limit", 0) or 0))
             dry = any(a.lower() in ("dry", "rehearse", "preview", "plan", "list") for a in args)
@@ -827,7 +854,7 @@ class CommandRouter:
             targets = []
             for row in rows:
                 name = str(row.get("username") or "")
-                if not name or name.lower() in whitelist:
+                if name and name.lower() in whitelist:
                     continue
                 if skip_verified and row.get("is_verified"):
                     continue
@@ -850,48 +877,47 @@ class CommandRouter:
                 lines.append("send /unfollowers  (no args) to do it for real")
                 return self._with_json("\n".join(lines), [r.get("username") for r in targets], "unfollowers_dry")
 
-            # Fast path: turbo = almost no gap
+            # Gaps only — no guardrail caps / no "already done today"
             turbo = bool(self.cfg.get("speed.turbo", True))
-            gap_min = float(self.cfg.get("unfollow.gap_min", 20) or 0)
-            gap_max = float(self.cfg.get("unfollow.gap_max", 60) or 0)
+            gap_min = float(self.cfg.get("unfollow.gap_min", 2) or 0)
+            gap_max = float(self.cfg.get("unfollow.gap_max", 5) or 0)
             if turbo:
-                gap_min = min(gap_min, 2.0)
-                gap_max = min(gap_max, 5.0)
+                gap_min = min(gap_min, 1.5)
+                gap_max = min(gap_max, 3.0)
             if gap_max < gap_min:
                 gap_max = gap_min
+
             done: list[str] = []
             failed: list[str] = []
             for row in targets:
                 name = str(row.get("username") or "")
                 pk = str(row.get("pk") or row.get("user_id") or "")
-                if self.guardrails is not None:
-                    decision = self.guardrails.check_action("unfollow", target=name or pk)
-                    if not decision.allowed:
-                        failed.append(f"@{name or pk} ({decision.reason})")
-                        continue
                 try:
-                    # Always prefer the numeric pk already stored in the graph.
-                    # Never force a username→id lookup when pk is present.
+                    # Prefer numeric pk. Never blocked by "already done" or hourly caps.
                     ok = self.client.unfollow_by_id(pk, name)
                 except Exception as exc:  # noqa: BLE001
-                    # One bad account must never abort the whole batch
                     failed.append(f"@{name or pk} ({type(exc).__name__})")
                     log.warning("unfollow failed for @%s (pk=%s): %s", name, pk, exc)
                     ok = False
                 if ok:
                     done.append(name or pk)
-                    if self.guardrails is not None:
-                        self.guardrails.record_action("unfollow", target=name or pk, detail="non-follower")
-                    if self.store is not None:
-                        self.store.record_action("unfollow", target=name or pk, detail="non-follower")
+                    # Record for history only — never used to block this command
+                    try:
+                        if self.store is not None:
+                            self.store.record_action("unfollow", target=name or pk, detail="non-follower")
+                    except Exception:  # noqa: BLE001
+                        pass
                 else:
                     if not any((name and name in f) or (pk and pk in f) for f in failed):
-                        failed.append(f"@{name or pk} (refused)")
+                        failed.append(f"@{name or pk} (refused by Instagram)")
                 if gap_max > 0:
                     time.sleep(gap_min + (time.time() % max(0.001, gap_max - gap_min)))
-            lines = [f"✅ unfollowed {len(done)} account(s)"]
+
+            lines = [
+                f"✅ unfollowed {len(done)} / {len(targets)} account(s)",
+            ]
             if failed:
-                lines.append(f"⚠️  {len(failed)} skipped: " + ", ".join(failed[:15]))
+                lines.append(f"⚠️  {len(failed)} refused by Instagram: " + ", ".join(failed[:15]))
                 if len(failed) > 15:
                     lines.append(f"… and {len(failed) - 15} more")
             return self._with_json("\n".join(lines), {"done": done, "failed": failed}, "unfollowers_done")

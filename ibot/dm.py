@@ -22,7 +22,9 @@ Three things make it safe to leave running unattended:
 from __future__ import annotations
 
 import hashlib
+import queue
 import random
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -77,6 +79,7 @@ class DMBot:
         rulebook: Rulebook,
         ai=None,
         command_router=None,
+        risk=None,
     ):
         self.client = client
         self.cfg = cfg
@@ -85,9 +88,27 @@ class DMBot:
         self.rulebook = rulebook
         self.ai = ai
         self.commands = command_router
+        self.risk = risk
         self._marker = str(self.cfg.get("reply.marker", "") or "")
+        # Set when a message arrives over the push channel, so the poll loop
+        # can wake up immediately instead of waiting for the next tick.
+        self.wake = threading.Event()
+        self.pushed = 0
+        # Pushed messages are handled by a worker so that the reply delay
+        # never blocks the push channel from reading.
+        self._push_queue: queue.Queue = queue.Queue()
+        self._worker: threading.Thread | None = None
 
     # -------------------------------------------------------------- helpers
+    def _quiet_until(self) -> float:
+        """A quiet period set by ``/quiet``."""
+        if self.store is None:
+            return 0.0
+        try:
+            return float(self.store.kv_get("quiet_until", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
     def _delay(self) -> int:
         """How long to wait before answering. Humans are not instant."""
         low = int(self.cfg.get("behaviour.reply_delay_min", 12) or 0)
@@ -176,6 +197,70 @@ class DMBot:
         return result
 
     # ------------------------------------------------------------- handlers
+    def handle_realtime(self, push) -> None:
+        """Queue a message that arrived over the push channel.
+
+        The push payload already carries the text, the thread and the
+        sender, so the bot can answer without reading the inbox at all.
+
+        The work is handed to a worker thread rather than done here: the
+        reply delay means this call can take a minute, and the push
+        channel must keep reading while it waits.
+        """
+        self.pushed += 1
+        self.wake.set()
+        self._ensure_worker()
+        self._push_queue.put(push)
+
+    def _ensure_worker(self) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._worker = threading.Thread(target=self._push_worker, name="push-worker", daemon=True)
+        self._worker.start()
+
+    def _push_worker(self) -> None:
+        while True:
+            push = self._push_queue.get()
+            try:
+                self._process_push(push)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("the push handler failed: %s", exc)
+
+    def _process_push(self, push) -> None:
+        # The push may or may not have flagged the message as ours, so the
+        # account id is checked as well.
+        own_id = self._own_id()
+        is_self = bool(push.is_self) or bool(own_id and push.user_id == own_id)
+
+        if is_self:
+            # A command sent to yourself.
+            thread = Thread(id=push.thread_id, title="", usernames=[], user_ids=[])
+            msg = Message(
+                id=push.message_id,
+                thread_id=push.thread_id,
+                text=push.text,
+                user_id=push.user_id,
+                username="",
+                timestamp=push.timestamp,
+                is_self=True,
+            )
+            result = PollResult()
+            self._handle_command(thread, msg, result)
+            return
+
+        thread = Thread(id=push.thread_id, title="", usernames=[], user_ids=[])
+        msg = Message(
+            id=push.message_id,
+            thread_id=push.thread_id,
+            text=push.text,
+            user_id=push.user_id,
+            username="",
+            timestamp=push.timestamp,
+            is_self=False,
+        )
+        result = PollResult()
+        self._handle_message(thread, msg, result)
+
     def _handle_message(self, thread: Thread, msg: Message, result: PollResult) -> None:
         fp = fingerprint_for(thread.id, msg.user_id, msg.id, msg.text)
         if not self.guardrails.record_inbound(thread.id, fp, detail=msg.text[:120]):
@@ -185,6 +270,10 @@ class DMBot:
 
         if bool(self.cfg.get("behaviour.baseline_only", False)):
             log.info("baseline: %s said %r", thread.peer, msg.text[:120])
+            return
+
+        if self._quiet_until() > time.time():
+            log.info("quiet period: not answering %r", msg.text[:60])
             return
 
         decision = self.guardrails.check(thread.id)
@@ -197,6 +286,16 @@ class DMBot:
         if not reply:
             result.skipped += 1
             return
+
+        # The risk guard has the last word: it knows about the global gap
+        # between visible actions, the daily ceiling, the warm-up ramp and
+        # whether the same text went out recently.
+        if self.risk is not None:
+            risk_decision = self.risk.check_reply(text=reply)
+            if not risk_decision.allowed:
+                result.blocked += 1
+                log.info("not answering %s: %s", thread.peer, risk_decision.reason)
+                return
 
         delay = self._delay()
         if delay:
@@ -211,6 +310,8 @@ class DMBot:
 
         # Only now does the reply count.
         self.guardrails.record_reply(thread.id, detail=source)
+        if self.risk is not None:
+            self.risk.record_reply(text=reply, target=thread.id)
         result.replied += 1
         log.info("answered %s via %s", thread.peer, source)
 

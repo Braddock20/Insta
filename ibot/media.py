@@ -153,58 +153,65 @@ class MediaBot:
         return found
 
     def auto_view_stories(self, usernames: list[str] | None = None) -> int:
-        """View the stories of the accounts you follow — fast path."""
+        """View every active story via the tray — Baileys-style, no following walk."""
         if not self._enabled("view"):
             return 0
-        names = usernames if usernames is not None else self._people_to_watch()
-        count = 0
-        found = self.stories_of(names)
+        # Prefer dedicated tray helper
+        if hasattr(self.client, "view_tray_stories") and usernames is None:
+            viewed, accounts = self.client.view_tray_stories()
+            if viewed:
+                log.info("tray: viewed %d stories from %d accounts", viewed, accounts)
+                if self.guardrails is not None:
+                    self.guardrails.record_action("story_view", target="tray", detail=f"{viewed} stories")
+            return viewed
+        # Optional filter path
+        found = self.stories_of(usernames)
+        all_pks = [s.pk for stories in found.values() for s in stories if s.pk]
+        if all_pks and self.client.view_stories(all_pks):
+            log.info("viewed %d stories from %d accounts", len(all_pks), len(found))
+            return len(all_pks)
+        return 0
 
-        def _one(item):
-            name, stories = item
-            if not stories or not self._allowed("story_view", name):
-                return 0
-            pks = [s.pk for s in stories]
-            if self.client.view_stories(pks):
-                self.guardrails.record_action("story_view", target=name, detail=f"{len(pks)} stories")
-                log.info("viewed %d stories from @%s", len(pks), name)
-                return len(pks)
-            return 0
+    def _seen_story_pks(self) -> set[str]:
+        if self.store is None:
+            return set()
+        raw = self.store.kv_get("auto:liked_stories") or ""
+        return {p for p in raw.split(",") if p}
 
-        from concurrent.futures import ThreadPoolExecutor
-        workers = int(self.cfg.get("speed.commands_parallel", 32) or 32)
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            for n in pool.map(_one, found.items()):
-                count += n
-        return count
+    def _mark_story_liked(self, pks: list[str]) -> None:
+        if self.store is None or not pks:
+            return
+        seen = self._seen_story_pks()
+        seen.update(pks)
+        # Keep last ~2000 to avoid unbounded growth
+        trimmed = list(seen)[-2000:]
+        self.store.kv_set("auto:liked_stories", ",".join(trimmed))
 
     def auto_like_stories(self, usernames: list[str] | None = None) -> int:
-        """Like every story of the accounts you follow — fast path."""
+        """Like every *new* active story via the tray — Baileys-style."""
         if not self._enabled("story"):
             return 0
-        names = usernames if usernames is not None else self._people_to_watch()
+        tray = {}
+        if hasattr(self.client, "stories_tray") and usernames is None:
+            tray = self.client.stories_tray(fill_items=True) or {}
+        else:
+            tray = self.stories_of(usernames)
+
+        already = self._seen_story_pks()
         count = 0
-        found = self.stories_of(names)
-
-        def _one(item):
-            name, stories = item
-            if not stories or not self._allowed("story_like", name):
-                return 0
-            n = 0
+        new_pks: list[str] = []
+        for name, stories in tray.items():
             for story in stories:
+                if not story.pk or story.pk in already:
+                    continue
                 if self.client.like_story(story.pk):
-                    self.guardrails.record_action("story_like", target=name, detail=story.pk)
-                    n += 1
-                    log.info("liked @%s's story %s", name, story.pk)
-                else:
-                    break
-            return n
-
-        from concurrent.futures import ThreadPoolExecutor
-        workers = int(self.cfg.get("speed.commands_parallel", 32) or 32)
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            for n in pool.map(_one, found.items()):
-                count += n
+                    count += 1
+                    new_pks.append(story.pk)
+                    if self.guardrails is not None:
+                        self.guardrails.record_action("story_like", target=name, detail=story.pk)
+        if new_pks:
+            self._mark_story_liked(new_pks)
+            log.info("tray: liked %d new stories from %d accounts", count, len(tray))
         return count
 
     # --------------------------------------------------------------- posts

@@ -292,13 +292,16 @@ class FakeClient(BaseClient):
         self._following.discard(username)
         return True
 
-    def follow_by_id(self, user_id: str) -> bool:
-        self.followed.append(user_id)
+    def follow_by_id(self, user_id: str, username: str = "") -> bool:
+        self.followed.append(username or user_id)
+        if username:
+            self._following.add(username)
         return True
 
     def unfollow_by_id(self, user_id: str, username: str = "") -> bool:
         self.unfollowed.append(username or user_id)
-        self._following.discard(username)
+        if username:
+            self._following.discard(username)
         return True
 
     # --------------------------------------------------------------- notes

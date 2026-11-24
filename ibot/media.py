@@ -17,7 +17,9 @@ with a DM if you want it to, but there is nothing to like.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 from . import log
 from .client.base import Story
@@ -56,22 +58,55 @@ class MediaBot:
             return False
         return True
 
-    def _people_to_watch(self, amount: int = 20) -> list[str]:
+    def _people_to_watch(self, amount: int = 0) -> list[str]:
         """The accounts the bot watches — the ones you follow."""
         me = self.client.whoami()
-        people = self.client.following(me.username, amount=amount)
+        people = self.client.connections("following", me.username, amount)
         return [p.username for p in people]
+
+    def _graph(self, flag: str) -> list[dict]:
+        """The connections graph, from the database.
+
+        A scan runs when the graph is empty, so the automations always have
+        the full picture and never the first thirty names.
+        """
+        if self.store is None:
+            return []
+        rows = self.store.connections(flag)
+        if rows:
+            return rows
+        try:
+            from .bulk import Scanner
+
+            Scanner(self.client, self.store, self.cfg).scan()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("the scan failed: %s", exc)
+            return []
+        return self.store.connections(flag)
 
     # ------------------------------------------------------------- stories
     def stories_of(self, usernames: list[str]) -> dict[str, list[Story]]:
-        """Stories per account, skipping the accounts that have none."""
+        """Stories per account, skipping the accounts that have none.
+
+        The accounts are read at the same time — reading two hundred
+        accounts one after the other is what made the bot feel slow.
+        """
         found: dict[str, list[Story]] = {}
-        for name in usernames:
+
+        def fetch(name: str):
             try:
-                stories = self.client.stories(name)
+                return name, self.client.stories(name)
             except Exception as exc:  # noqa: BLE001
                 log.debug("no stories for @%s: %s", name, exc)
-                continue
+                return name, None
+
+        workers = int(self.cfg.get("speed.commands_parallel", 8) or 8)
+        if workers > 1 and len(usernames) > 1:
+            with ThreadPoolExecutor(max_workers=min(workers, len(usernames))) as pool:
+                results = list(pool.map(fetch, usernames))
+        else:
+            results = [fetch(name) for name in usernames]
+        for name, stories in results:
             if stories:
                 found[name] = stories
         return found
@@ -94,7 +129,12 @@ class MediaBot:
         return count
 
     def auto_like_stories(self, usernames: list[str] | None = None) -> int:
-        """Like the newest story of the accounts you follow."""
+        """Like the stories of the accounts you follow — *every* one of them.
+
+        The old version liked the newest story of each account and left the
+        rest alone. A story that is still up an hour later is a story you
+        were asked to like, so all of them are.
+        """
         if not self._enabled("story"):
             return 0
         names = usernames if usernames is not None else self._people_to_watch()
@@ -102,12 +142,13 @@ class MediaBot:
         for name, stories in self.stories_of(names).items():
             if not self._allowed("story_like", name):
                 continue
-            newest = stories[0]
-            if self.client.like_story(newest.pk):
-                self.guardrails.record_action("story_like", target=name, detail=newest.pk)
-                count += 1
-                log.info("liked @%s's story", name)
-            time.sleep(0.4)
+            for story in stories:
+                if self.client.like_story(story.pk):
+                    self.guardrails.record_action("story_like", target=name, detail=story.pk)
+                    count += 1
+                    log.info("liked @%s's story %s", name, story.pk)
+                else:
+                    break
         return count
 
     # --------------------------------------------------------------- posts
@@ -140,15 +181,12 @@ class MediaBot:
         """Follow the accounts that followed you and that you do not follow."""
         if not self._enabled("follow"):
             return 0
-        me = self.client.whoami()
-        try:
-            followers = {p.username for p in self.client.followers(me.username, amount=50)}
-            following = {p.username for p in self.client.following(me.username, amount=50)}
-        except Exception as exc:  # noqa: BLE001
-            log.warning("could not read the follower lists: %s", exc)
-            return 0
+        rows = self._graph("fans")
         count = 0
-        for name in sorted(followers - following):
+        for row in rows:
+            name = str(row.get("username") or "")
+            if not name:
+                continue
             if not self._allowed("follow", name):
                 continue
             if self.client.follow(name):
@@ -162,8 +200,10 @@ class MediaBot:
     def auto_read_notes(self) -> list:
         """Read the notes in the inbox.
 
-        Notes cannot be liked — Instagram never built a like control for
-        them — so this only reads them and records them.
+        Notes cannot be *liked* with a like button — Instagram never built
+        one — but a note is a message, and messages can carry a reaction.
+        When ``automations.like_notes`` is on, the bot puts a heart on every
+        note that is there.
         """
         if not self._enabled("note"):
             return []
@@ -177,6 +217,94 @@ class MediaBot:
                 continue
             self.store.record_activity("note", note.username, note.text[:120], fingerprint=note.id)
         return notes
+
+    def auto_like_notes(self, notes: list | None = None) -> int:
+        """Put a heart on every note that is there."""
+        if notes is None:
+            try:
+                notes = self.client.notes()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not read the notes: %s", exc)
+                return 0
+        count = 0
+        for note in notes or []:
+            if not note.text:
+                continue
+            if not self._allowed("like", note.username):
+                break
+            thread_id = str(getattr(note, "thread_id", "") or "")
+            message_id = str(getattr(note, "id", "") or "")
+            liked = False
+            if thread_id and message_id:
+                liked = bool(self.client.react(thread_id, message_id, "❤️"))
+            if not liked:
+                media_id = str(getattr(note, "media_id", "") or "")
+                if media_id:
+                    liked = bool(self.client.like_story(media_id))
+            if liked:
+                self.guardrails.record_action("like", target=note.username, detail="note")
+                count += 1
+                log.info("liked @%s's note", note.username)
+        return count
+
+    # ------------------------------------------------------------ unfollows
+    def auto_unfollow_nonfollowers(self) -> int:
+        """Remove the accounts that do not follow you back.
+
+        Off by default, and a rehearsal until ``unfollow.dry_run`` is
+        switched off. The gap between two removals is the one thing that
+        keeps this from being a red flag.
+        """
+        if not bool(self.cfg.get("unfollow.enabled", False)):
+            return 0
+        if not self._enabled("unfollow"):
+            return 0
+        try:
+            from .bulk import Scanner
+
+            scanner = Scanner(self.client, self.store, self.cfg)
+            summary = scanner.scan()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("the scan failed: %s", exc)
+            return 0
+
+        rows = self.store.connections("nonfollowers") if self.store is not None else []
+        whitelist = {
+            name.strip().lstrip("@").lower()
+            for name in str(self.cfg.get("unfollow.whitelist", "") or "").split(",")
+            if name.strip()
+        }
+        targets = [
+            row
+            for row in rows
+            if str(row.get("username") or "").lower() not in whitelist
+        ]
+        limit = int(self.cfg.get("unfollow.limit", 0) or 0)
+        if limit:
+            targets = targets[:limit]
+        if not targets:
+            return 0
+
+        if bool(self.cfg.get("unfollow.dry_run", True)):
+            log.info("rehearsal: %d non-followers would be unfollowed", len(targets))
+            return 0
+
+        gap_min = float(self.cfg.get("unfollow.gap_min", 20) or 0)
+        gap_max = float(self.cfg.get("unfollow.gap_max", 60) or 0)
+        if gap_max < gap_min:
+            gap_max = gap_min
+        count = 0
+        for row in targets:
+            name = str(row.get("username") or "")
+            if not self._allowed("unfollow", name):
+                break
+            if self.client.unfollow_by_id(str(row.get("pk") or ""), name):
+                self.guardrails.record_action("unfollow", target=name, detail="non-follower")
+                count += 1
+                log.info("unfollowed @%s (does not follow back)", name)
+            if gap_max:
+                time.sleep(gap_min + (time.time() % max(0.001, gap_max - gap_min)))
+        return count
 
     # ------------------------------------------------------------- welcome
     def auto_welcome_new_followers(self) -> int:
@@ -195,10 +323,11 @@ class MediaBot:
             return 0
 
         me = self.client.whoami()
-        try:
-            followers = {p.username for p in self.client.followers(me.username, amount=50)}
-        except Exception as exc:  # noqa: BLE001
-            log.warning("could not read the followers: %s", exc)
+        rows = self._graph("followers")
+        followers = {str(row.get("username") or "") for row in rows}
+        followers.discard("")
+        if not followers:
+            log.warning("could not read the followers")
             return 0
 
         known_raw = self.store.kv_get("auto:followers")
@@ -325,7 +454,12 @@ class MediaBot:
 
     # ----------------------------------------------------------------- run
     def run_once(self) -> dict:
-        """Run every enabled automatic action once."""
+        """Run every enabled automatic action once — at the same time.
+
+        The jobs do not depend on each other, so there is no reason to run
+        them one after the other. That was the second reason the bot felt
+        slow: every pass did its work in a queue.
+        """
         summary = {
             "stories_viewed": 0,
             "stories_liked": 0,
@@ -334,37 +468,50 @@ class MediaBot:
             "welcomed": 0,
             "comments_answered": 0,
             "stories_published": 0,
+            "notes_read": 0,
+            "notes_liked": 0,
+            "unfollowed": 0,
         }
-        try:
-            summary["stories_viewed"] = self.auto_view_stories()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("auto view stories failed: %s", exc)
-        try:
-            summary["stories_liked"] = self.auto_like_stories()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("auto like stories failed: %s", exc)
-        try:
-            summary["posts_liked"] = self.auto_like_posts()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("auto like posts failed: %s", exc)
-        try:
-            summary["followed_back"] = self.auto_follow_back()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("auto follow back failed: %s", exc)
-        try:
-            self.auto_read_notes()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("auto read notes failed: %s", exc)
-        try:
-            summary["welcomed"] = self.auto_welcome_new_followers()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("auto welcome failed: %s", exc)
-        try:
-            summary["comments_answered"] = self.auto_answer_comments()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("auto answer comments failed: %s", exc)
-        try:
-            summary["stories_published"] = self.auto_publish_story()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("auto publish story failed: %s", exc)
+
+        def notes_job() -> tuple[int, int]:
+            notes = self.auto_read_notes() or []
+            liked = 0
+            if bool(self.cfg.get("automations.like_notes", False)):
+                liked = self.auto_like_notes(notes)
+            return len(notes), liked
+
+        jobs: list[tuple[str, Any]] = [
+            ("stories_viewed", self.auto_view_stories),
+            ("stories_liked", self.auto_like_stories),
+            ("posts_liked", self.auto_like_posts),
+            ("followed_back", self.auto_follow_back),
+            ("notes", notes_job),
+            ("welcomed", self.auto_welcome_new_followers),
+            ("comments_answered", self.auto_answer_comments),
+            ("stories_published", self.auto_publish_story),
+            ("unfollowed", self.auto_unfollow_nonfollowers),
+        ]
+
+        def run(job: tuple[str, Any]):
+            key, fn = job
+            try:
+                return key, fn()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("the automatic action %s failed: %s", key, exc)
+                return key, 0
+
+        workers = int(self.cfg.get("speed.commands_parallel", 8) or 8)
+        if workers > 1 and len(jobs) > 1:
+            with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+                results = list(pool.map(run, jobs))
+        else:
+            results = [run(job) for job in jobs]
+
+        for key, value in results:
+            if key == "notes":
+                read, liked = value if isinstance(value, tuple) else (0, 0)
+                summary["notes_read"] = read
+                summary["notes_liked"] = liked
+            else:
+                summary[key] = value
         return summary

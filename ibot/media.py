@@ -85,27 +85,68 @@ class MediaBot:
         return self.store.connections(flag)
 
     # ------------------------------------------------------------- stories
-    def stories_of(self, usernames: list[str]) -> dict[str, list[Story]]:
-        """Stories per account, skipping the accounts that have none.
+    def stories_of(self, usernames: list[str] | None = None) -> dict[str, list[Story]]:
+        """Stories for accounts that actually have them — light path.
 
-        The accounts are read at the same time — reading two hundred
-        accounts one after the other is what made the bot feel slow.
+        1. Prefer reels_tray (1 request for the whole following set)
+        2. Else batch by numeric pk (GraphQL 25-at-a-time or low-concurrency by id)
+        3. Never do per-user usernameinfo lookups
         """
-        found: dict[str, list[Story]] = {}
-
-        def fetch(name: str):
+        # 1) Official tray — only people with live stories
+        if hasattr(self.client, "stories_tray"):
             try:
-                return name, self.client.stories(name)
+                tray = self.client.stories_tray() or {}
+                if tray:
+                    if usernames:
+                        wanted = {n.lstrip("@").lower() for n in usernames}
+                        tray = {k: v for k, v in tray.items() if k.lower() in wanted}
+                    return tray
+            except Exception as exc:  # noqa: BLE001
+                log.debug("stories_tray failed: %s", exc)
+
+        # 2) Resolve pks from the graph / connections, then batch by id
+        pairs: list[tuple[str, str]] = []
+        if self.store is not None:
+            try:
+                rows = self.store.connections("following")
+                for row in rows:
+                    uid = str(row.get("pk") or row.get("user_id") or "")
+                    name = str(row.get("username") or "")
+                    if uid and name:
+                        pairs.append((uid, name))
+            except Exception:  # noqa: BLE001
+                pairs = []
+        if not pairs and usernames:
+            # last resort: only the names we were given (may still lookup id once)
+            for name in usernames:
+                try:
+                    uid = self.client.user_id(name)
+                    pairs.append((uid, name))
+                except Exception:
+                    continue
+
+        if usernames:
+            wanted = {n.lstrip("@").lower() for n in usernames}
+            pairs = [(u, n) for u, n in pairs if n.lower() in wanted]
+
+        if hasattr(self.client, "stories_for_ids") and pairs:
+            return self.client.stories_for_ids(pairs) or {}
+
+        # 3) Final fallback: by-id only, low concurrency
+        found: dict[str, list[Story]] = {}
+        def fetch(pair):
+            uid, name = pair
+            try:
+                return name, self.client.stories_by_id(uid, username=name)
             except Exception as exc:  # noqa: BLE001
                 log.debug("no stories for @%s: %s", name, exc)
                 return name, None
-
-        workers = int(self.cfg.get("speed.commands_parallel", 32) or 32)
-        if workers > 1 and len(usernames) > 1:
-            with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-                results = list(pool.map(fetch, usernames))
+        workers = min(8, max(1, len(pairs)))
+        if workers > 1 and len(pairs) > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(fetch, pairs))
         else:
-            results = [fetch(name) for name in usernames]
+            results = [fetch(p) for p in pairs]
         for name, stories in results:
             if stories:
                 found[name] = stories

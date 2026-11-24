@@ -30,13 +30,9 @@ network:
   # expect. Example: "http://user:pass@host:port".
   proxy: ""
 
-  # A random pause between API calls, in seconds. It looks human and keeps
-  # the request rate far away from any limit.
-  #
-  # This is the pause on *ordinary* calls. A bulk scan drops it entirely
-  # (see speed.turbo) — reading your own follower list is not something a
-  # person does one page at a time with a pause in between.
-  delay_range: [0.3, 0.8]
+  # A random pause between API calls, in seconds. Kept very low for speed.
+  # Turbo mode already skips this on bulk scans.
+  delay_range: [0.05, 0.2]
 
   request_timeout: 10
   session_retries: 3
@@ -50,8 +46,8 @@ speed:
   engine: "auto"
 
   # How many things are read at the same time: stories of many accounts,
-  # commands in one message, tasks in the queue.
-  commands_parallel: 8
+  # commands in one message, tasks in the queue. High = ultimate speed.
+  commands_parallel: 64
 
   # How many names Instagram gives back per page. 200 is the most the
   # private API hands over in one go.
@@ -73,18 +69,18 @@ scan:
 # Removing the accounts that do not follow you back.
 unfollow:
   # Master switch. Nothing is removed while this is false.
-  enabled: false
+  enabled: true
 
-  # Rehearsal: the plan is written down, nothing is touched.
-  dry_run: true
+  # Rehearsal is no longer the default. /unfollowers acts immediately.
+  dry_run: false
 
   # How many to remove in one run. 0 means no limit.
   limit: 0
 
-  # The pause between two removals, in seconds. This is the single rule
-  # that keeps a cleanup from looking like a cleanup.
-  gap_min: 20
-  gap_max: 60
+  # The pause between two removals, in seconds. Turbo mode already
+  # clamps these lower; keep them small for ultimate speed.
+  gap_min: 2
+  gap_max: 5
 
   # Accounts that are never removed, separated by commas.
   whitelist: ""
@@ -99,59 +95,59 @@ state:
 
 behaviour:
   # How often to check the inbox, in seconds. The push channel is the fast
-  # path — this is the fallback.
-  poll_seconds: 15
+  # path — this is the fallback. Low = near-instant reaction.
+  poll_seconds: 5
 
   # How many conversations to read per poll.
-  thread_count: 25
+  thread_count: 40
 
   # Read the "message requests" folder too (people who wrote to you first).
   read_requests: true
 
   # How long to wait before answering, randomly inside this range. People do
-  # not reply instantly. Neither should the bot.
-  reply_delay_min: 12
-  reply_delay_max: 55
+  # not reply instantly. Neither should the bot. Commands ignore this.
+  reply_delay_min: 3
+  reply_delay_max: 12
 
   # Minimum gap between two answers in the same conversation.
-  cooldown_seconds: 900
+  cooldown_seconds: 120
 
-  # Reply caps. These are what stops a busy day from turning into a flood.
-  hourly_cap: 8
-  daily_cap: 25
-  global_daily_cap: 120
+  # Reply caps. Raised for speed; still present so the account is not banned.
+  hourly_cap: 40
+  daily_cap: 200
+  global_daily_cap: 600
 
   # True = read and log, never answer. Turn this on for the first few days.
-  baseline_only: true
+  baseline_only: false
 
   # Accepting a message request is a visible action, so it is your call.
   accept_requests: false
 
   # How often the automatic actions (stories, likes, follow back) run.
-  automations_every_seconds: 900
+  # Low value = almost real-time like/view of new posts & stories.
+  automations_every_seconds: 60
 
-  # Caps for the visible actions — likes, follows, story views. These are
-  # tighter than the DM caps on purpose: a burst of follows and likes is
-  # exactly what makes an account look automated.
+  # Caps for the visible actions — likes, follows, story views.
+  # Raised hard for ultimate speed. Lower them if you see challenges.
   action_caps:
-    like:            { hourly: 20, daily: 100 }
-    unlike:          { hourly: 20, daily: 100 }
-    follow:          { hourly: 5,  daily: 20 }
-    unfollow:        { hourly: 5,  daily: 20 }
-    comment_reply:   { hourly: 8,  daily: 30 }
-    story_reply:     { hourly: 5,  daily: 20 }
-    story_view:      { hourly: 20, daily: 80 }
-    story_like:      { hourly: 20, daily: 80 }
-    story_post:      { hourly: 2,  daily: 6 }
+    like:            { hourly: 120, daily: 800 }
+    unlike:          { hourly: 60,  daily: 300 }
+    follow:          { hourly: 30,  daily: 120 }
+    unfollow:        { hourly: 40,  daily: 150 }
+    comment_reply:   { hourly: 30,  daily: 120 }
+    story_reply:     { hourly: 20,  daily: 80 }
+    story_view:      { hourly: 200, daily: 1500 }
+    story_like:      { hourly: 200, daily: 1500 }
+    story_post:      { hourly: 4,   daily: 12 }
 
 automations:
   enabled: true
 
-  # The default state of each automatic action. The /auto commands in the DM
-  # change these at runtime, and they are remembered.
-  default_view: false     # view the stories of the people you follow
-  default_like: false     # like their posts
-  default_story: false    # like their stories
+  # Defaults turned ON so new posts/stories get liked & viewed automatically.
+  # /auto commands still let you flip them at runtime.
+  default_view: true      # view the stories of the people you follow
+  default_like: true      # like their newest posts
+  default_story: true     # like their stories
   default_follow: false   # follow the people who followed you
   default_comment: false  # answer comments on your posts
   default_note: true      # read the notes that arrive
@@ -191,18 +187,17 @@ risk:
 
   # The total number of visible actions per day, whatever the per-kind
   # caps say. Likes, follows, story views, comments and welcomes all
-  # count towards this one number.
-  daily_visible_ceiling: 60
+  # count towards this one number. Raised for ultimate speed.
+  daily_visible_ceiling: 2000
 
-  # The pause between any two visible actions, in seconds. The bot picks a
-  # random time inside this range. This single rule removes more risk than
-  # every other one put together.
-  min_visible_gap_seconds: 20
-  max_visible_gap_seconds: 75
+  # The pause between any two visible actions, in seconds. Kept low for
+  # speed; raise if Instagram starts challenging the account.
+  min_visible_gap_seconds: 1
+  max_visible_gap_seconds: 4
 
   # How many visible actions may happen inside one burst window.
-  burst_limit: 3
-  burst_window_seconds: 600
+  burst_limit: 30
+  burst_window_seconds: 120
 
   # The same text is never sent twice inside this window.
   dedupe_hours: 12

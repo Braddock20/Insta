@@ -123,9 +123,9 @@ behaviour:
   # Accepting a message request is a visible action, so it is your call.
   accept_requests: false
 
-  # How often the automatic actions (stories, likes, follow back) run.
-  # Low value = almost real-time like/view of new posts & stories.
-  automations_every_seconds: 60
+  # How often the tray is pulled for new stories/posts (Baileys-style poll).
+  # 30s ≈ near-realtime reaction to new stories without hammering the API.
+  automations_every_seconds: 30
 
   # Caps for the visible actions — likes, follows, story views.
   # Raised hard for ultimate speed. Lower them if you see challenges.

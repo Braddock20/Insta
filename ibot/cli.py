@@ -314,6 +314,17 @@ def cmd_watch(args) -> int:
     session, api = _client(cfg, risk=risk)
 
     media = MediaBot(api, cfg, store, guardrails, risk=risk)
+
+    # The push channel. When Instagram delivers a message over the socket
+    # the bot answers it straight away instead of waiting for the poll.
+    # It is built *before* the router so the router can report on it, and it
+    # is started *after* the bot exists so the callback always has a target.
+    # (The router used to be given no bridge at all, so /realtime answered
+    # "the push channel is not attached" on a perfectly healthy channel.)
+    bridge = None
+    if bool(cfg.get("realtime.enabled", True)):
+        bridge = RealtimeBridge(api.cl, cfg, on_message=lambda push: bot.handle_realtime(push))
+
     router = CommandRouter(
         api,
         cfg,
@@ -323,6 +334,7 @@ def cmd_watch(args) -> int:
         media=media,
         risk=risk,
         protocol=session.protocol,
+        realtime=bridge,
     )
     bot = DMBot(api, cfg, store, guardrails, rulebook, ai, command_router=router, risk=risk)
 
@@ -330,11 +342,7 @@ def cmd_watch(args) -> int:
         bot.prime()
         print("✅ the inbox was recorded as seen; nothing will be answered")
 
-    # The push channel. When Instagram delivers a message over the socket
-    # the bot answers it straight away instead of waiting for the poll.
-    bridge = None
-    if bool(cfg.get("realtime.enabled", True)):
-        bridge = RealtimeBridge(api.cl, cfg, on_message=bot.handle_realtime)
+    if bridge is not None:
         bridge.start()
         print("📡 the push channel is connecting — answers will come in seconds")
 

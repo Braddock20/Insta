@@ -146,6 +146,59 @@ class CommandRouter:
                 return int(text)
         return default
 
+    @staticmethod
+    def _is_count(text: str) -> bool:
+        """Is this argument a number of accounts rather than a name?"""
+        text = (text or "").strip().lower()
+        return text in ("all", "every", "*") or text.isdigit()
+
+    def _user_and_limit(self, args: list[str]) -> tuple[str, int]:
+        """Split the arguments of a list command into (user, limit).
+
+        ``/following``          — everybody you follow
+        ``/following all``      — everybody you follow, every page
+        ``/following 50``       — the first fifty
+        ``/following @user 50`` — that user's first fifty
+
+        The count may come first, so ``/following all`` is not read as "the
+        account called @all" — which is what it used to do.
+        """
+        args = list(args or [])
+        user = ""
+        if args and not self._is_count(args[0]):
+            user = args[0].lstrip("@")
+            args = args[1:]
+        return user, self._limit(args)
+
+    def _dump(self, kind: str, user: str, people: list) -> str:
+        """Keep the whole list on disk — a DM cannot hold 50,000 names.
+
+        (This is a method of the router, not a helper inside the command
+        block: it used to be defined in the wrong place and every call to
+        ``/followers`` and ``/following`` died with an AttributeError.)
+        """
+        try:
+            from .bulk import write_jsonl
+
+            folder = self.scanner.folder()
+            path = folder / f"{kind}-{user}.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "pk": p.user_id,
+                        "username": p.username,
+                        "full_name": p.full_name,
+                        "is_private": p.is_private,
+                        "is_verified": p.is_verified,
+                    }
+                    for p in people
+                ],
+            )
+            return str(path)
+        except Exception:  # noqa: BLE001
+            return "the state folder"
+
     def _graph(self, flag: str) -> list[dict]:
         """The connections graph from the database.
 
@@ -595,8 +648,9 @@ class CommandRouter:
 
         @self.register("followers", "every follower: /followers [user] [n|all]")
         def _followers(args, thread):
-            user = args[0].lstrip("@") if args else self.client.whoami().username
-            limit = self._limit(args[1:])
+            user, limit = self._user_and_limit(args)
+            if not user:
+                user = self.client.whoami().username
             people = self.client.connections("followers", user, limit)
             if not people:
                 return "no followers to show"
@@ -609,8 +663,9 @@ class CommandRouter:
 
         @self.register("following", "everyone you follow: /following [user] [n|all]")
         def _following(args, thread):
-            user = args[0].lstrip("@") if args else self.client.whoami().username
-            limit = self._limit(args[1:])
+            user, limit = self._user_and_limit(args)
+            if not user:
+                user = self.client.whoami().username
             people = self.client.connections("following", user, limit)
             if not people:
                 return "not following anyone"
@@ -620,30 +675,6 @@ class CommandRouter:
             if len(people) > 60:
                 lines.append(f"… and {len(people) - 60} more — the whole list is in {path}")
             return "\n".join(lines)
-
-        def _dump(kind: str, user: str, people: list) -> str:
-            """Keep the whole list on disk — a DM cannot hold 50,000 names."""
-            try:
-                from .bulk import write_jsonl
-
-                folder = self.scanner.folder()
-                path = folder / f"{kind}-{user}.jsonl"
-                write_jsonl(
-                    path,
-                    [
-                        {
-                            "pk": p.user_id,
-                            "username": p.username,
-                            "full_name": p.full_name,
-                            "is_private": p.is_private,
-                            "is_verified": p.is_verified,
-                        }
-                        for p in people
-                    ],
-                )
-                return str(path)
-            except Exception:  # noqa: BLE001
-                return "the state folder"
 
         @self.register("followback", "follow the people who followed you")
         def _followback(args, thread):
@@ -682,6 +713,16 @@ class CommandRouter:
                     f"{mark} {kind}: {result.get('count', 0)} in {result.get('elapsed_ms', 0)} ms"
                 )
             lines = ["the picture is taken:", *parts]
+            if not summary.get("ok", True):
+                errors = [
+                    f"{kind}: {result.get('error')}"
+                    for kind, result in lists.items()
+                    if not result.get("ok") and result.get("error")
+                ]
+                if errors:
+                    lines.append("⚠️ " + "; ".join(errors))
+            for warning in summary.get("warnings", []) or []:
+                lines.append(f"⚠️ {warning}")
             if "diff" in summary:
                 lines.append(
                     f"non-followers: {summary.get('nonfollowers', 0)} · "

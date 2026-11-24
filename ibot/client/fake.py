@@ -50,10 +50,15 @@ class FakeClient(BaseClient):
             )
         }
         self._following: set[str] = set()
+        self._graph: bool | None = None
+        self._graph_followers: set[str] = set()
+        self._graph_following: set[str] = set()
         self._seen: list[str] = []
         self.sent: list[tuple[str, str]] = []
         self.liked: list[str] = []
         self.followed: list[str] = []
+        self.unfollowed: list[str] = []
+        self.reacted: list[tuple[str, str, str]] = []
         self.blocked: list[str] = []
         self.muted: list[str] = []
         self.archived: list[str] = []
@@ -182,6 +187,7 @@ class FakeClient(BaseClient):
         return True
 
     def react(self, thread_id: str, message_id: str, emoji: str = "❤️") -> bool:
+        self.reacted.append((thread_id, message_id, emoji))
         return True
 
     # ------------------------------------------------------------- content
@@ -249,10 +255,33 @@ class FakeClient(BaseClient):
         return [m for m in self._media.values() if m.username == username][:amount]
 
     def followers(self, username: str, amount: int = 50) -> list[Profile]:
-        return list(self._profiles.values())[:amount]
+        return self.connections("followers", username, amount)
 
     def following(self, username: str, amount: int = 50) -> list[Profile]:
-        return list(self._profiles.values())[:amount]
+        return self.connections("following", username, amount)
+
+    def connections(self, kind: str, username: str, amount: int = 0) -> list[Profile]:
+        """The whole follower/following list — every page of it.
+
+        ``amount`` of 0 means all of them.
+        """
+        if self._graph is not None:
+            names = self._graph_followers if kind == "followers" else self._graph_following
+            people = [self._profiles[n] for n in sorted(names) if n in self._profiles]
+        else:
+            people = list(self._profiles.values())
+        return people[:amount] if amount else people
+
+    def set_graph(self, followers: list[str], following: list[str]) -> None:
+        """Put a follower graph in place — used by the tests."""
+        self._graph = True
+        self._graph_followers = set(followers)
+        self._graph_following = set(following)
+        for name in list(self._graph_followers) + list(self._graph_following):
+            self._profiles.setdefault(
+                name,
+                Profile(user_id=str(abs(hash(name)) % 100000), username=name, full_name=name),
+            )
 
     def follow(self, username: str) -> bool:
         self.followed.append(username)
@@ -260,6 +289,15 @@ class FakeClient(BaseClient):
         return True
 
     def unfollow(self, username: str) -> bool:
+        self._following.discard(username)
+        return True
+
+    def follow_by_id(self, user_id: str) -> bool:
+        self.followed.append(user_id)
+        return True
+
+    def unfollow_by_id(self, user_id: str, username: str = "") -> bool:
+        self.unfollowed.append(username or user_id)
         self._following.discard(username)
         return True
 
@@ -274,6 +312,7 @@ class FakeClient(BaseClient):
             text=text,
             username=username,
             created_at=time.time(),
+            thread_id="notes",
         )
         self._notes.append(note)
         return note

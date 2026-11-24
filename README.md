@@ -578,6 +578,49 @@ with a web cookie, it would remove the ten-second read entirely.)
 
 ---
 
+## Fixed on 2026-11-24
+
+Six bugs that made the bot answer "nothing" while looking busy. They are
+listed here because a silent wrong answer is worse than a crash, and the
+next person to read the log should know what was wrong.
+
+**The scan said "0 followers".** The Rust engine was handed an empty cookie,
+because the cookies were read from `session_dict` — a dict that does not
+exist in instagrapi. Instagram answered HTTP 401, the engine reported the
+empty answer as a success, and the bot believed it. The cookies now come
+from `cookie_dict`, the jar the client really talks with. A refused walk is
+now an error, not a zero, and the Python engine takes over when the binary
+fails.
+
+**`ds_user_id` broke every request.** Sending the whole cookie jar to the
+friendships endpoints makes Instagram answer HTTP 403 ("something went
+wrong"). The engine is given `sessionid` and `csrftoken` and nothing else.
+
+**`/following` and `/followers` always crashed.** The helper that writes the
+list to disk was defined in the wrong place and called as `self._dump`, so
+every call ended in an AttributeError.
+
+**`/following all` meant "@all".** The count word is now recognised before
+the name, so `/following all` is everybody and `/following @all` is still
+the account called @all.
+
+**The list came back empty.** The engine hands its result over through a
+file. When a command did not ask for a file, the list was thrown away and
+the count was right — so `/following` said "not following anyone" while the
+scan said 491.
+
+**Every command ran twice.** The fingerprint that keeps a message from being
+answered twice mixed in the thread id, and the push channel and the inbox
+disagree about the id of the note-to-self conversation. The message id is
+the identity now, and a push without one is left to the inbox.
+
+Also: the push channel was never handed to the command router, so `/realtime`
+always said "not attached"; the app identity was never written to disk, so
+the bot wore a fresh identity on every start; and the engine's timeout was
+five hours instead of five minutes.
+
+---
+
 ## The name
 
 Baileys is the library that made WhatsApp programmable without WhatsApp

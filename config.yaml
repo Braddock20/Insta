@@ -133,7 +133,7 @@ behaviour:
     like:            { hourly: 120, daily: 800 }
     unlike:          { hourly: 60,  daily: 300 }
     follow:          { hourly: 30,  daily: 120 }
-    unfollow:        { hourly: 40,  daily: 150 }
+    unfollow:        { hourly: 0,   daily: 0 }   # 0 = unlimited — /unfollowers ignores caps
     comment_reply:   { hourly: 30,  daily: 120 }
     story_reply:     { hourly: 20,  daily: 80 }
     story_view:      { hourly: 200, daily: 1500 }

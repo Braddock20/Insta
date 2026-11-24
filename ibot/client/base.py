@@ -254,12 +254,12 @@ class BaseClient:
     def unfollow(self, username: str) -> bool:
         raise NotImplementedError
 
-    def follow_by_id(self, user_id: str) -> bool:
-        """Follow by id — the bulk path never needs the username."""
+    def follow_by_id(self, user_id: str, username: str = "") -> bool:
+        """Follow by numeric id. Username is optional fallback only."""
         raise NotImplementedError
 
     def unfollow_by_id(self, user_id: str, username: str = "") -> bool:
-        """Unfollow by id, or by name when only the name is known."""
+        """Unfollow by numeric id. Prefer pk; username only used if pk missing."""
         raise NotImplementedError
 
     # ------------------------------------------------------------- notes

@@ -87,6 +87,52 @@ DEFAULTS: dict[str, Any] = {
         "default_follow": False,
         "default_comment": False,
         "default_note": True,
+        "default_welcome": False,
+        "default_storypost": False,
+        # The message a new follower gets. {username} and {name} are filled in.
+        "welcome_message": "Thanks for following! If you have any questions, just send us a message.",
+        # The answer a new comment gets.
+        "comment_message": "Thanks for the comment! {username} — we really appreciate it.",
+        # How many of your own posts to check for comments.
+        "comment_posts": 3,
+        # A folder of photos that are published as stories, one per run.
+        "story_folder": "",
+        "story_caption": "",
+    },
+    "risk": {
+        # How many API calls the bot may make in an hour. Instagram's own
+        # limits are far higher, but a bot that makes a few hundred calls
+        # an hour looks exactly like a person using the app.
+        "requests_per_hour": 600,
+        # The total number of visible actions per day — likes, follows,
+        # story views, comments, welcomes — whatever the per-kind caps say.
+        "daily_visible_ceiling": 60,
+        # The pause between any two visible actions, in seconds. The bot
+        # picks a random time inside this range.
+        "min_visible_gap_seconds": 20,
+        "max_visible_gap_seconds": 75,
+        # How many visible actions may happen inside one burst window.
+        "burst_limit": 3,
+        "burst_window_seconds": 600,
+        # The same text is never sent twice inside this window.
+        "dedupe_hours": 12,
+        # A new account is allowed very little at first: the budget is
+        # 15% on day 1, 40% after two days, 70% after six, and the full
+        # amount after thirteen.
+        "warmup_days": [2, 6, 13],
+        # How long the bot stops acting when Instagram pushes back.
+        "safe_mode_minutes": 60,
+    },
+    "protocol": {
+        # How often the bot checks whether its app identity still works.
+        "reprobe_seconds": 86400,
+        # Where the working identity is remembered.
+        "protocol_file": "state/protocol.json",
+    },
+    "realtime": {
+        # Use Instagram's push channel. When it works, answers go out in
+        # seconds instead of waiting for the next poll.
+        "enabled": True,
     },
     "api": {
         "enabled": False,
@@ -155,6 +201,9 @@ def _apply_env(cfg: dict) -> dict:
         "IGBOT_BASELINE_ONLY": ("behaviour", "baseline_only"),
         "IGBOT_ACCEPT_REQUESTS": ("behaviour", "accept_requests"),
         "IGBOT_AUTOMATIONS_ENABLED": ("automations", "enabled"),
+        "IGBOT_REALTIME_ENABLED": ("realtime", "enabled"),
+        "IGBOT_RISK_CEILING": ("risk", "daily_visible_ceiling"),
+        "IGBOT_PROTOCOL_FILE": ("protocol", "protocol_file"),
         "IGBOT_API_ENABLED": ("api", "enabled"),
         "IGBOT_API_PORT": ("api", "port"),
         "IGBOT_KEEPALIVE_ENABLED": ("keepalive", "enabled"),

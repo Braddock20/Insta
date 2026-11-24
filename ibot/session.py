@@ -85,6 +85,11 @@ class SessionManager:
         self._status = SessionStatus()
         self._last_attempt = 0.0
         self._min_retry_gap = 30.0
+        # The protocol layer owns the app identity — the app id, the app
+        # version and the device the account is seen as.
+        from .protocol import ProtocolManager
+
+        self.protocol = ProtocolManager(cfg)
 
     # ------------------------------------------------------------- plumbing
     @property
@@ -166,6 +171,15 @@ class SessionManager:
             session_retry_total=retries,
             session_retry_backoff_factor=2,
         )
+
+        # Put on the identity that was working last time, so the account
+        # keeps looking like the same phone on the same app version.
+        try:
+            identity = self.protocol.restore()
+            self.protocol.apply(client, identity)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not apply the saved app identity: %s", exc)
+
         return client
 
     # ---------------------------------------------------------------- login

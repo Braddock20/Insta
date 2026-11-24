@@ -1,0 +1,38 @@
+name: Keep the bot awake
+
+# A free Render web service is put to sleep after 15 minutes without
+# incoming traffic, and waking it up again takes about 30 seconds — which is
+# exactly the moment a customer writes and expects an answer.
+#
+# This workflow pings the bot every 10 minutes from outside Render, so the
+# instance never sleeps.
+#
+# Set the repository secret BOT_URL to https://<your-service>.onrender.com
+# and the job does the rest. GitHub's free tier allows 2,000 minutes a month;
+# this uses about 7,200 a month on a 10-minute cron, so run it on a private
+# repo with a slightly longer interval, or use any other cron service if
+# that is not enough. Every 14 minutes is still well under the 15-minute
+# cut-off.
+
+on:
+  schedule:
+    - cron: "*/14 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the bot's health endpoint
+        env:
+          BOT_URL: ${{ secrets.BOT_URL }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          if [ -z "$BOT_URL" ]; then
+            echo "BOT_URL is not set — add it as a repository secret"
+            exit 0
+          fi
+          code=$(curl -sS -o /dev/null -w "%{http_code}" \
+            ${BOT_TOKEN:+-H "Authorization: Bearer $BOT_TOKEN"} \
+            "$BOT_URL/api/health" || echo 000)
+          echo "health check: $code"

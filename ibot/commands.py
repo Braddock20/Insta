@@ -546,71 +546,33 @@ class CommandRouter:
                     break
             return f"✅ liked {liked} of {len(stories)} stories from @{user}"
 
-        @self.register("storiesall", "like active stories (light tray path)")
+        @self.register("storiesall", "pull story tray and like every active story")
         def _storiesall(args, thread):
-            # Light path: tray (1 req) → else batch by pk. Never N usernameinfo calls.
-            found: dict = {}
-            if hasattr(self.client, "stories_tray"):
-                found = self.client.stories_tray() or {}
-            if not found:
-                me = self.client.whoami()
-                people = self.client.connections("following", me.username, 0)
-                pairs = [
-                    (str(getattr(p, "user_id", "") or ""), p.username)
-                    for p in people
-                    if getattr(p, "user_id", None)
-                ]
-                if hasattr(self.client, "stories_for_ids"):
-                    found = self.client.stories_for_ids(pairs)
+            # Baileys-style: one tray pull → like everything active. No following walk.
+            if hasattr(self.client, "like_tray_stories"):
+                liked, accounts = self.client.like_tray_stories()
+                return f"✅ liked {liked} stories from {accounts} accounts (tray)"
+            # Fallback
+            tray = self.client.stories_tray(fill_items=True) if hasattr(self.client, "stories_tray") else {}
             total = 0
-            lines = []
-            for uname, stories in found.items():
-                liked = 0
+            for uname, stories in tray.items():
                 for story in stories:
-                    if self._allowed("story_like", uname):
-                        if self.client.like_story(story.pk):
-                            liked += 1
-                            if self.guardrails is not None:
-                                self.guardrails.record_action(
-                                    "story_like", target=uname, detail=story.pk
-                                )
-                    else:
-                        break
-                if liked:
-                    total += liked
-                    lines.append(f"@{uname}: {liked}")
-            return f"✅ liked {total} stories from {len(found)} accounts\n" + "\n".join(lines[:40])
+                    if story.pk and self.client.like_story(story.pk):
+                        total += 1
+            return f"✅ liked {total} stories from {len(tray)} accounts (tray)"
 
-        @self.register("viewall", "view active stories (light tray path)")
+        @self.register("viewall", "pull story tray and mark every active story seen")
         def _viewall(args, thread):
-            # Light path: tray / batch by pk — never one usernameinfo per follow
-            found: dict = {}
-            if hasattr(self.client, "stories_tray"):
-                found = self.client.stories_tray() or {}
-            if not found:
-                me = self.client.whoami()
-                people = self.client.connections("following", me.username, 0)
-                pairs = [
-                    (str(getattr(p, "user_id", "") or ""), p.username)
-                    for p in people
-                    if getattr(p, "user_id", None)
-                ]
-                if hasattr(self.client, "stories_for_ids"):
-                    found = self.client.stories_for_ids(pairs)
-            all_pks: list[str] = []
-            for uname, stories in found.items():
-                pks = [s.pk for s in stories if s.pk]
-                if not pks:
-                    continue
-                all_pks.extend(pks)
-                if self.guardrails is not None:
-                    self.guardrails.record_action(
-                        "story_view", target=uname, detail=f"{len(pks)} stories"
-                    )
+            # Baileys-style: one tray pull → mark all seen.
+            if hasattr(self.client, "view_tray_stories"):
+                viewed, accounts = self.client.view_tray_stories()
+                return f"✅ viewed {viewed} stories from {accounts} accounts (tray)"
+            tray = self.client.stories_tray(fill_items=True) if hasattr(self.client, "stories_tray") else {}
+            all_pks = [s.pk for stories in tray.values() for s in stories if s.pk]
             if all_pks:
                 self.client.view_stories(all_pks)
             return (
-                f"✅ viewed {len(all_pks)} stories from {len(found)} accounts"
+                f"✅ viewed {len(all_pks)} stories from {len(tray)} accounts (tray)"
                 if all_pks
                 else "no active stories right now"
             )

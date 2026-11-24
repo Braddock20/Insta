@@ -62,10 +62,22 @@ class PollResult:
 def fingerprint_for(thread_id: str, sender: str, message_id: str, text: str) -> str:
     """Stable identity of an inbound message.
 
-    The message id is part of the hash, so the same text sent twice is two
-    different messages — but the same message seen twice is one message.
+    The **message id** is the identity. Instagram gives every direct message
+    a unique id, and it is the same id whether the message arrives over the
+    push channel or comes out of the inbox API — so it is the one field the
+    two paths agree on. The thread and the sender are only used for a
+    message that arrives without an id.
+
+    (Mixing them in was how every command came to be run twice: the push
+    payload and the inbox disagree about the id of the note-to-self thread,
+    so the very same message got two different fingerprints, the duplicate
+    guard never fired, and a toggle like ``/autoview`` flipped itself back
+    off again on the second run.)
     """
-    raw = f"{thread_id}|{sender}|{message_id}|{text}".encode("utf-8")
+    if message_id:
+        raw = f"msg|{message_id}".encode("utf-8")
+    else:
+        raw = f"{thread_id}|{sender}|{message_id}|{text}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:32]
 
 
@@ -272,6 +284,12 @@ class DMBot:
                 self._push_done += 1
 
     def _handle_push(self, push) -> None:
+        if not str(getattr(push, "message_id", "") or "").strip():
+            # Without an id there is no way to tell this message apart from
+            # the copy the inbox hands over on the next poll. Leave it to the
+            # inbox — a command must never run twice.
+            log.info("a push message arrived without an id — leaving it to the poll")
+            return
         # The push may or may not have flagged the message as ours, so the
         # account id is checked as well.
         own_id = self._own_id()

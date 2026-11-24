@@ -20,6 +20,7 @@ own API over plain HTTP:
 | Install | downloads Chromium (~180 MB) | 2 Python packages |
 | Answers | 20-60 s per page load | ~1 s per API call |
 | Login | new device fingerprint every start | one saved identity, reused |
+| Delivery | poll every 45 s | push channel, seconds |
 
 What is still worth keeping here:
 

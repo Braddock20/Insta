@@ -26,6 +26,7 @@ import queue
 import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from . import log
@@ -48,6 +49,7 @@ class PollResult:
     skipped: int = 0
     commands: int = 0
     errors: list[str] = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def summary(self) -> str:
         return (
@@ -98,6 +100,8 @@ class DMBot:
         # never blocks the push channel from reading.
         self._push_queue: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
+        self._push_lock = threading.Lock()
+        self._push_done = 0
 
     # -------------------------------------------------------------- helpers
     def _quiet_until(self) -> float:
@@ -187,12 +191,33 @@ class DMBot:
 
         result.threads_seen = len(threads)
 
+        # Commands go to you, customers go to customers. The commands are
+        # independent of each other, so they run at the same time — that is
+        # the difference between a command landing in a second and a
+        # command landing after the whole inbox has been read.
+        commands: list[tuple[Thread, Message]] = []
         for thread in threads:
             for msg in sorted(thread.messages, key=lambda m: m.timestamp or 0):
                 if msg.is_self or (own_id and msg.user_id == own_id):
+                    commands.append((thread, msg))
+                else:
+                    self._handle_message(thread, msg, result)
+
+        if commands:
+            def run_command(item: tuple[Thread, Message]) -> None:
+                thread, msg = item
+                try:
                     self._handle_command(thread, msg, result)
-                    continue
-                self._handle_message(thread, msg, result)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("command %r failed: %s", msg.text, exc)
+
+            workers = int(self.cfg.get("speed.commands_parallel", 8) or 8)
+            if workers > 1 and len(commands) > 1:
+                with ThreadPoolExecutor(max_workers=min(workers, len(commands))) as pool:
+                    list(pool.map(run_command, commands))
+            else:
+                for item in commands:
+                    run_command(item)
 
         return result
 
@@ -212,6 +237,19 @@ class DMBot:
         self._ensure_worker()
         self._push_queue.put(push)
 
+    def drain(self, timeout: float = 2.0) -> None:
+        """Wait until everything that arrived over the push channel is done.
+
+        The push channel answers in a worker thread, so anything that wants
+        to see the answer has to wait for it.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._push_lock:
+                if self._push_done >= self.pushed:
+                    return
+            time.sleep(0.01)
+
     def _ensure_worker(self) -> None:
         if self._worker is not None and self._worker.is_alive():
             return
@@ -227,6 +265,13 @@ class DMBot:
                 log.exception("the push handler failed: %s", exc)
 
     def _process_push(self, push) -> None:
+        try:
+            self._handle_push(push)
+        finally:
+            with self._push_lock:
+                self._push_done += 1
+
+    def _handle_push(self, push) -> None:
         # The push may or may not have flagged the message as ours, so the
         # account id is checked as well.
         own_id = self._own_id()
@@ -335,7 +380,8 @@ class DMBot:
         except Exception as exc:  # noqa: BLE001
             log.error("command %r failed: %s", msg.text, exc)
             answer = f"❌ that command failed: {exc}"
-        result.commands += 1
+        with result.lock:
+            result.commands += 1
         if answer:
             self.client.send_text(thread.id, self._decorate(answer))
 

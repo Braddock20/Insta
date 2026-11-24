@@ -1,0 +1,53 @@
+# Render Blueprint — igbot
+#
+# The default service is a **free web service**. That is the cheapest option,
+# and it comes with two limitations that matter for a bot:
+#
+#   * it spins down after 15 minutes without inbound traffic, so something
+#     has to ping /api/health (see RENDER_DEPLOY.md for the keep-alive);
+#   * it cannot have a persistent disk, so the SQLite state and the browser
+#     profile are wiped on every cold start. The bot re-primes itself when
+#     that happens, so it never answers the same message twice.
+#
+# For an always-on bot with a persistent disk, replace this file's service
+# with the background worker shown at the bottom of RENDER_DEPLOY.md.
+
+services:
+  - type: web
+    name: igbot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: false
+    healthCheckPath: /api/health
+    envVars:
+      # Your Instagram session cookie. Treat it like a password.
+      - key: IGBOT_COOKIE
+        sync: false
+
+      # The bearer token for the control API. Leave it empty to keep every
+      # route closed except /api/health.
+      - key: IGBOT_API_TOKEN
+        sync: false
+
+      # The bot reads but never replies until you change this.
+      - key: IGBOT_BASELINE_ONLY
+        value: "true"
+
+      - key: IGBOT_API_ENABLED
+        value: "true"
+
+      - key: IGBOT_POLL_SECONDS
+        value: "90"
+
+      - key: IGBOT_LOG_LEVEL
+        value: INFO
+
+      # On a free service this directory is ephemeral. It is a persistent
+      # disk mount point when you switch to a paid instance with a disk.
+      - key: IGBOT_PROFILE_DIR
+        value: /app/state/profile
+
+      - key: IGBOT_LOG_FILE
+        value: /app/state/igbot.log

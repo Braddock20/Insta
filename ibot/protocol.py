@@ -177,7 +177,13 @@ class ProtocolManager:
     def _protocol_file(self) -> Path:
         if self.settings_path is not None:
             return self.settings_path
-        return Path(str(self.cfg.resolve("session.protocol_file") or "state/protocol.json"))
+        # The key lives under "protocol", not "session" — asking for the
+        # wrong one resolved to the project root, and writing the identity
+        # there failed, so the bot wore a fresh app identity on every start.
+        path = Path(str(self.cfg.resolve("protocol.protocol_file") or ""))
+        if not str(path) or path.is_dir():
+            path = self.cfg.path("state", "protocol.json")
+        return path
 
     def _load(self) -> dict[str, Any]:
         path = self._protocol_file()

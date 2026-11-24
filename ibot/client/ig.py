@@ -124,6 +124,8 @@ class ApiClient(BaseClient):
         # Visible actions are serialised. Reads run in parallel; writes do
         # not, because Instagram does not like two of them at once.
         self._write_lock = threading.Lock()
+        # The names that were looked up already.
+        self._id_cache: dict[str, str] = {}
 
     # ------------------------------------------------------------- plumbing
     def _call(self, fn: Callable, *args, **kwargs):
@@ -182,10 +184,20 @@ class ApiClient(BaseClient):
         clean = (username or "").strip().lstrip("@")
         if not clean:
             raise InstagramError("no username given", kind="input")
+        # A name belongs to one id for as long as it exists, so the answer
+        # is remembered. Walking 335 accounts for their stories costs two
+        # requests each without this — one of them only to look the id up.
+        cached = self._id_cache.get(clean)
+        if cached:
+            return cached
         try:
-            return str(self._call(self.cl.user_id_from_username, clean))
+            resolved = str(self._call(self.cl.user_id_from_username, clean))
         except InstagramError as exc:
             raise InstagramError(f"@{clean} was not found", kind="notfound") from exc
+        if len(self._id_cache) > 5000:
+            self._id_cache.clear()
+        self._id_cache[clean] = resolved
+        return resolved
 
     def search_users(self, query: str, amount: int = 10) -> list[Profile]:
         results = self._call(self.cl.direct_search, query) or []

@@ -100,9 +100,9 @@ class MediaBot:
                 log.debug("no stories for @%s: %s", name, exc)
                 return name, None
 
-        workers = int(self.cfg.get("speed.commands_parallel", 8) or 8)
+        workers = int(self.cfg.get("speed.commands_parallel", 32) or 32)
         if workers > 1 and len(usernames) > 1:
-            with ThreadPoolExecutor(max_workers=min(workers, len(usernames))) as pool:
+            with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
                 results = list(pool.map(fetch, usernames))
         else:
             results = [fetch(name) for name in usernames]
@@ -112,68 +112,90 @@ class MediaBot:
         return found
 
     def auto_view_stories(self, usernames: list[str] | None = None) -> int:
-        """View the stories of the accounts you follow."""
+        """View the stories of the accounts you follow — fast path."""
         if not self._enabled("view"):
             return 0
         names = usernames if usernames is not None else self._people_to_watch()
         count = 0
-        for name, stories in self.stories_of(names).items():
-            if not self._allowed("story_view", name):
-                continue
+        found = self.stories_of(names)
+
+        def _one(item):
+            name, stories = item
+            if not stories or not self._allowed("story_view", name):
+                return 0
             pks = [s.pk for s in stories]
             if self.client.view_stories(pks):
                 self.guardrails.record_action("story_view", target=name, detail=f"{len(pks)} stories")
-                count += len(pks)
                 log.info("viewed %d stories from @%s", len(pks), name)
-            time.sleep(0.4)
+                return len(pks)
+            return 0
+
+        from concurrent.futures import ThreadPoolExecutor
+        workers = int(self.cfg.get("speed.commands_parallel", 32) or 32)
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            for n in pool.map(_one, found.items()):
+                count += n
         return count
 
     def auto_like_stories(self, usernames: list[str] | None = None) -> int:
-        """Like the stories of the accounts you follow — *every* one of them.
-
-        The old version liked the newest story of each account and left the
-        rest alone. A story that is still up an hour later is a story you
-        were asked to like, so all of them are.
-        """
+        """Like every story of the accounts you follow — fast path."""
         if not self._enabled("story"):
             return 0
         names = usernames if usernames is not None else self._people_to_watch()
         count = 0
-        for name, stories in self.stories_of(names).items():
-            if not self._allowed("story_like", name):
-                continue
+        found = self.stories_of(names)
+
+        def _one(item):
+            name, stories = item
+            if not stories or not self._allowed("story_like", name):
+                return 0
+            n = 0
             for story in stories:
                 if self.client.like_story(story.pk):
                     self.guardrails.record_action("story_like", target=name, detail=story.pk)
-                    count += 1
+                    n += 1
                     log.info("liked @%s's story %s", name, story.pk)
                 else:
                     break
+            return n
+
+        from concurrent.futures import ThreadPoolExecutor
+        workers = int(self.cfg.get("speed.commands_parallel", 32) or 32)
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            for n in pool.map(_one, found.items()):
+                count += n
         return count
 
     # --------------------------------------------------------------- posts
     def auto_like_posts(self, usernames: list[str] | None = None) -> int:
-        """Like the newest post of the accounts you follow."""
+        """Like the newest post of the accounts you follow — fast path."""
         if not self._enabled("like"):
             return 0
-        names = usernames if usernames is not None else self._people_to_watch(10)
+        names = usernames if usernames is not None else self._people_to_watch(40)
         count = 0
-        for name in names:
+
+        def _one(name: str) -> int:
             if not self._allowed("like", name):
-                continue
+                return 0
             try:
-                posts = self.client.user_posts(name, amount=2)
+                posts = self.client.user_posts(name, amount=1)
             except Exception as exc:  # noqa: BLE001
                 log.debug("no posts for @%s: %s", name, exc)
-                continue
+                return 0
             if not posts:
-                continue
+                return 0
             post = posts[0]
             if self.client.like_media(post.pk):
                 self.guardrails.record_action("like", target=name, detail=post.pk)
-                count += 1
                 log.info("liked @%s's post %s", name, post.pk)
-            time.sleep(0.5)
+                return 1
+            return 0
+
+        from concurrent.futures import ThreadPoolExecutor
+        workers = int(self.cfg.get("speed.commands_parallel", 32) or 32)
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            for n in pool.map(_one, names):
+                count += n
         return count
 
     # ------------------------------------------------------------- follows

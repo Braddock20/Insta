@@ -107,6 +107,8 @@ class Note:
     username: str = ""
     created_at: float = 0.0
     expires_at: float = 0.0
+    thread_id: str = ""
+    media_id: str = ""
 
 
 @dataclass
@@ -235,10 +237,26 @@ class BaseClient:
     def following(self, username: str, amount: int = 50) -> list[Profile]:
         raise NotImplementedError
 
+    def connections(self, kind: str, username: str, amount: int = 0) -> list[Profile]:
+        """Every follower or every following account.
+
+        ``amount`` of 0 means the whole list — every page of the cursor
+        chain, not just the first one.
+        """
+        raise NotImplementedError
+
     def follow(self, username: str) -> bool:
         raise NotImplementedError
 
     def unfollow(self, username: str) -> bool:
+        raise NotImplementedError
+
+    def follow_by_id(self, user_id: str) -> bool:
+        """Follow by id — the bulk path never needs the username."""
+        raise NotImplementedError
+
+    def unfollow_by_id(self, user_id: str, username: str = "") -> bool:
+        """Unfollow by id, or by name when only the name is known."""
         raise NotImplementedError
 
     # ------------------------------------------------------------- notes

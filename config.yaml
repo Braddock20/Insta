@@ -98,6 +98,21 @@ automations:
   default_follow: false   # follow the people who followed you
   default_comment: false  # answer comments on your posts
   default_note: true      # read the notes that arrive
+  default_welcome: false  # say hello to new followers
+  default_storypost: false  # publish a story from the story folder
+
+  # What a new follower gets. {username} and {name} are replaced.
+  welcome_message: "Thanks for following! If you have any questions, just send us a message."
+
+  # What a new comment gets.
+  comment_message: "Thanks for the comment! {username} — we really appreciate it."
+
+  # How many of your own posts to check for comments.
+  comment_posts: 3
+
+  # A folder of photos that are published as stories, one per run.
+  story_folder: ""
+  story_caption: ""
 
   # Recurring work. "09:00" is every day at 09:00; "every 30m" is every half
   # hour. The kind is any task kind.
@@ -105,6 +120,51 @@ automations:
     # - name: morning_stories
     #   kind: auto:view
     #   schedule: "09:00"
+
+# The risk controls. These are the rules that keep the account from looking
+# automated — and they are the reason it does not get restricted.
+risk:
+  # How many API calls per hour. Instagram allows far more, but a few
+  # hundred an hour is exactly what a person browsing the app does.
+  requests_per_hour: 600
+
+  # The total number of visible actions per day, whatever the per-kind
+  # caps say. Likes, follows, story views, comments and welcomes all
+  # count towards this one number.
+  daily_visible_ceiling: 60
+
+  # The pause between any two visible actions, in seconds. The bot picks a
+  # random time inside this range. This single rule removes more risk than
+  # every other one put together.
+  min_visible_gap_seconds: 20
+  max_visible_gap_seconds: 75
+
+  # How many visible actions may happen inside one burst window.
+  burst_limit: 3
+  burst_window_seconds: 600
+
+  # The same text is never sent twice inside this window.
+  dedupe_hours: 12
+
+  # A new account is allowed very little at first: 15% on day one, 40%
+  # after two days, 70% after six, and the full amount after thirteen.
+  warmup_days: [2, 6, 13]
+
+  # How long the bot stops acting when Instagram pushes back. It is
+  # doubled every time it happens again.
+  safe_mode_minutes: 60
+
+# Which app identity the bot wears. Instagram expects a very specific app
+# version, and a version that is too old starts failing quietly.
+protocol:
+  reprobe_seconds: 86400
+  protocol_file: "state/protocol.json"
+
+# Instagram's push channel. When it works, answers go out in seconds
+# instead of waiting for the next poll. The bot falls back to polling if
+# the connection cannot be made.
+realtime:
+  enabled: true
 
 reply:
   # Sent when nothing more specific matches.

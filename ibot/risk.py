@@ -76,6 +76,11 @@ class RiskGuard:
         self.cfg = cfg
         self.store = store
         self.state = RiskState()
+        # While a bulk scan is running the hourly *request* budget is not
+        # enforced: reading your own follower list is a few hundred pages,
+        # and the budget exists to stop runaway action loops, not to stop
+        # the bot from looking at its own account. Safe mode still applies.
+        self.bulk = False
 
     # ------------------------------------------------------------- settings
     def _num(self, path: str, default: float) -> float:
@@ -177,7 +182,7 @@ class RiskGuard:
                 f"({self.state.safe_reason})"
             )
         used = self.store.count(KIND_REQUEST, hour_start())
-        if self.request_budget_hour and used >= self.request_budget_hour:
+        if self.request_budget_hour and used >= self.request_budget_hour and not self.bulk:
             raise RiskStop(
                 f"the hourly request budget is spent ({used}/{self.request_budget_hour}). "
                 "The bot is resting until the top of the hour."

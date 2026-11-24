@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -152,19 +153,27 @@ class Scheduler:
         A handler returns ``(ok, message)`` or just ``ok``. A task that raises
         is marked failed and retried up to ``max_attempts`` times; after that
         it is abandoned rather than retried forever.
+
+        The tasks do not depend on each other, so they run at the same time.
         """
         results: list[dict] = []
         max_attempts = 3
+        tasks = self.due(now)[:limit]
+        if not tasks:
+            return results
 
-        for task in self.due(now)[:limit]:
+        def run(task: Task) -> dict:
             handler = handlers.get(task.kind)
             if handler is None:
                 self.store.finish_task(
                     task.id, status="failed", error=f"no handler for {task.kind!r}"
                 )
-                results.append({"id": task.id, "kind": task.kind, "ok": False,
-                                "message": f"no handler for {task.kind!r}"})
-                continue
+                return {
+                    "id": task.id,
+                    "kind": task.kind,
+                    "ok": False,
+                    "message": f"no handler for {task.kind!r}",
+                }
 
             try:
                 outcome = handler(task)
@@ -179,16 +188,26 @@ class Scheduler:
                         task.kind, payload=task.payload, run_at=time.time() + 300,
                         fingerprint=None,
                     )
-                results.append({"id": task.id, "kind": task.kind, "ok": False, "message": str(exc)})
-                continue
+                return {"id": task.id, "kind": task.kind, "ok": False, "message": str(exc)}
 
             ok, message = _split(outcome)
             self.store.finish_task(
                 task.id, status="done" if ok else "failed", result=str(message)[:300]
             )
-            results.append({"id": task.id, "kind": task.kind, "ok": ok, "message": message})
             log.info("task %s (%s) finished: %s", task.id, task.kind, message)
+            return {"id": task.id, "kind": task.kind, "ok": ok, "message": message}
 
+        workers = 8
+        if self.cfg is not None:
+            try:
+                workers = int(self.cfg.get("speed.commands_parallel", 8) or 8)
+            except Exception:  # noqa: BLE001
+                workers = 8
+        if workers > 1 and len(tasks) > 1:
+            with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as pool:
+                results = list(pool.map(run, tasks))
+        else:
+            results = [run(task) for task in tasks]
         return results
 
     # ------------------------------------------------------------- schedules

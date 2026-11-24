@@ -1,42 +1,28 @@
-# igbot — convenience targets
-PY := .venv/bin/python
+# InstaBaileys — the everyday commands.
+#
+#   make install   install the Python package
+#   make rust      build the Rust engine into bin/
+#   make test      run the test suite
+#   make run       start the bot
 
-.PHONY: help install test doctor baseline watch selftest stats probe clean
+PY ?= python3
 
-help:
-	@echo "make install    - install dependencies and the browser"
-	@echo "make test       - run the test suite (mock Instagram, no account needed)"
-	@echo "make doctor     - check the live setup"
-	@echo "make baseline   - read the inbox and show what would be replied"
-	@echo "make watch      - run the 24/7 loop"
-	@echo "make selftest   - test the send path against your own account"
-	@echo "make stats      - show counters"
-	@echo "make probe      - dump the live page structure (maintenance)"
+.PHONY: install rust test run clean
 
 install:
-	./install.sh
+	$(PY) -m pip install -e .
+
+rust:
+	cd rust/igfast && cargo build --release
+	mkdir -p bin && cp rust/igfast/target/release/igfast bin/igfast
+	@echo "the engine is in bin/igfast"
 
 test:
-	$(PY) -m pytest tests/ -q
+	$(PY) -m pytest -q || $(PY) tools/run_tests.py
 
-doctor:
-	$(PY) -m igbot doctor
-
-baseline:
-	$(PY) -m igbot baseline
-
-watch:
-	$(PY) -m igbot watch
-
-selftest:
-	$(PY) -m igbot selftest
-
-stats:
-	$(PY) -m igbot stats
-
-probe:
-	$(PY) tools/probe_live.py --out probe
+run:
+	$(PY) -m ibot watch
 
 clean:
-	rm -rf probe .pytest_cache
-	find . -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
+	rm -rf bin rust/igfast/target
+	find . -name '__pycache__' -type d -prune -exec rm -rf {} +

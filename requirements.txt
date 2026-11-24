@@ -1,2 +1,8 @@
-playwright>=1.40
+# InstaBaileys runtime dependencies.
+#
+# instagrapi is the Instagram Private API client — the transport that replaces
+# the browser. PyYAML reads the config. Everything else is a transitive
+# dependency of instagrapi (requests, pydantic, Pillow).
+
+instagrapi>=3.2.19
 PyYAML>=6.0

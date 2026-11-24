@@ -486,43 +486,77 @@ class ApiClient(BaseClient):
     def following(self, username: str, amount: int = 50) -> list[Profile]:
         return self.connections("following", username, amount)
 
-    def follow_by_id(self, user_id: str) -> bool:
-        """Follow by id — the bulk path never needs the username."""
-        fn = getattr(self.cl, "user_friendship_v1", None)
-        if fn is None:
-            return False
+    def follow_by_id(self, user_id: str, username: str = "") -> bool:
+        """Follow by numeric id. Username is optional and only used as last resort."""
+        uid = str(user_id or "").strip()
+        if not uid:
+            if username:
+                try:
+                    uid = self.user_id(username)
+                except InstagramError:
+                    return False
+            else:
+                return False
         try:
             with self._write_lock:
-                return bool(self._call(fn, str(user_id)))
+                if hasattr(self.cl, "user_follow"):
+                    return bool(self._call(self.cl.user_follow, uid))
+                fn = getattr(self.cl, "user_friendship_v1", None)
+                if fn is not None:
+                    return bool(self._call(fn, uid))
         except InstagramError:
             return False
+        return False
 
     def unfollow_by_id(self, user_id: str, username: str = "") -> bool:
-        """Unfollow by id, or by name when only the name is known."""
-        if username:
-            return self.unfollow(username)
-        fn = getattr(self.cl, "user_friendship_v1_unfollow", None)
-        if fn is None:
-            return False
+        """Unfollow by numeric id. Never requires a username lookup when pk is known.
+
+        Previous code preferred username → user_id_from_username, which fails for
+        many real accounts (restricted, soft-banned, renamed, edge cases) even
+        when the pk from the following list is still perfectly valid.
+        """
+        uid = str(user_id or "").strip()
+        if not uid or not uid.isdigit():
+            # Only fall back to username when we truly have no usable id
+            if username:
+                try:
+                    uid = self.user_id(username)
+                except InstagramError:
+                    return False
+            else:
+                return False
         try:
             with self._write_lock:
-                return bool(self._call(fn, str(user_id)))
+                # Primary: standard instagrapi unfollow by id
+                if hasattr(self.cl, "user_unfollow"):
+                    return bool(self._call(self.cl.user_unfollow, uid))
+                # Alternate friendship endpoint some builds expose
+                fn = getattr(self.cl, "user_friendship_v1_unfollow", None)
+                if fn is not None:
+                    return bool(self._call(fn, uid))
+                # Last resort private request
+                fn2 = getattr(self.cl, "private_request", None)
+                if fn2 is not None:
+                    self._call(fn2, f"friendships/destroy/{uid}/")
+                    return True
         except InstagramError:
             return False
+        return False
 
     def follow(self, username: str) -> bool:
-        uid = self.user_id(username)
         try:
-            return bool(self._call(self.cl.user_follow, uid))
+            uid = self.user_id(username)
         except InstagramError:
             return False
+        return self.follow_by_id(uid, username)
 
     def unfollow(self, username: str) -> bool:
-        uid = self.user_id(username)
+        """Unfollow by username. Resolves id once, then uses the robust by-id path."""
         try:
-            return bool(self._call(self.cl.user_unfollow, uid))
+            uid = self.user_id(username)
         except InstagramError:
             return False
+        return self.unfollow_by_id(uid, username)
 
     # --------------------------------------------------------------- notes
     def notes(self) -> list[Note]:

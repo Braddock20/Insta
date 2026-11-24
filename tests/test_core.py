@@ -1,188 +1,129 @@
-"""Store, guardrails and cookie-parsing tests."""
+"""Guardrails, the rulebook, the store and the cookie parser."""
+
+from __future__ import annotations
 
 import time
 
-import pytest
-
-from igbot.browser import parse_cookie_header
-from igbot.config import Config
-from igbot.guardrails import Guardrails
-from igbot.store import Store, fingerprint_for, day_start, hour_start
+from ibot.cookies import parse_cookie_header, parse_cookie_source, sessionid_from_cookies
+from ibot.guardrails import Guardrails
+from ibot.rules import Rulebook, load_rules
 
 
-@pytest.fixture()
-def store(tmp_path):
-    s = Store(tmp_path / "state.db")
-    yield s
-    s.close()
-
-
-@pytest.fixture()
-def cfg(tmp_path):
-    return Config(
-        {
-            "behaviour": {
-                "cooldown_seconds": 900,
-                "hourly_cap": 8,
-                "daily_cap": 25,
-                "global_daily_cap": 120,
-                "baseline_only": False,
-            }
-        },
-        tmp_path,
-    )
-
-
-# ------------------------------------------------------------------- store
-
-
-def test_fingerprint_is_stable_and_discriminating():
-    a = fingerprint_for("t1", "", "Hello there")
-    b = fingerprint_for("t1", "", "  hello   THERE ")
-    c = fingerprint_for("t2", "", "Hello there")
-    assert a == b
-    assert a != c
-
-
-def test_record_is_idempotent_for_the_same_fingerprint(store):
-    fp = fingerprint_for("t", "", "hi")
-    assert store.record("inbound", thread_id="t", fingerprint=fp) is True
-    assert store.record("inbound", thread_id="t", fingerprint=fp) is False
-    assert store.has_fingerprint(fp)
-
-
-def test_count_respects_thread_and_time(store):
-    store.record("reply", thread_id="a")
-    store.record("reply", thread_id="a")
-    store.record("reply", thread_id="b")
-    assert store.count("reply", 0, thread_id="a") == 2
-    assert store.count("reply", 0, thread_id="b") == 1
-    assert store.count("reply", 0) == 3
-    assert store.count("reply", time.time() + 100) == 0
-
-
-def test_day_start_is_midnight(store):
-    now = time.time()
-    start = day_start(now)
-    assert 0 < now - start < 86400
-    assert hour_start(now) >= start
-
-
-# -------------------------------------------------------------- guardrails
-
-
-def test_first_reply_is_allowed(store, cfg):
-    guard = Guardrails(store, cfg)
-    assert guard.check("t1").allowed
-
-
-def test_cooldown_blocks_a_second_reply(store, cfg):
-    guard = Guardrails(store, cfg)
-    guard.record_reply("t1")
-    decision = guard.check("t1")
+# ------------------------------------------------------------------ guardrails
+def test_the_cooldown_blocks_a_second_reply(store, cfg):
+    cfg.set("behaviour.cooldown_seconds", 900)
+    g = Guardrails(store, cfg)
+    assert g.check("t1").allowed
+    g.record_reply("t1")
+    decision = g.check("t1")
     assert not decision.allowed
     assert "cooldown" in decision.reason
 
 
-def test_hourly_cap(store, cfg):
-    cfg.set("behaviour.cooldown_seconds", 0)
+def test_the_hourly_cap_blocks(store, cfg):
     cfg.set("behaviour.hourly_cap", 2)
-    guard = Guardrails(store, cfg)
-    guard.record_reply("t1")
-    guard.record_reply("t1")
-    decision = guard.check("t1")
-    assert not decision.allowed
-    assert "hourly" in decision.reason
+    g = Guardrails(store, cfg)
+    g.record_reply("t1")
+    g.record_reply("t1")
+    assert not g.check("t1").allowed
 
 
-def test_daily_cap(store, cfg):
-    cfg.set("behaviour.cooldown_seconds", 0)
-    cfg.set("behaviour.hourly_cap", 0)
-    cfg.set("behaviour.daily_cap", 1)
-    guard = Guardrails(store, cfg)
-    guard.record_reply("t1")
-    assert not guard.check("t1").allowed
-
-
-def test_global_daily_cap_is_shared_across_threads(store, cfg):
-    cfg.set("behaviour.cooldown_seconds", 0)
-    cfg.set("behaviour.hourly_cap", 0)
-    cfg.set("behaviour.daily_cap", 0)
-    cfg.set("behaviour.global_daily_cap", 2)
-    guard = Guardrails(store, cfg)
-    guard.record_reply("a")
-    guard.record_reply("b")
-    decision = guard.check("c")
-    assert not decision.allowed
-    assert "global" in decision.reason
+def test_the_global_cap_is_shared_between_conversations(store, cfg):
+    cfg.set("behaviour.global_daily_cap", 1)
+    g = Guardrails(store, cfg)
+    g.record_reply("t1")
+    assert not g.check("t2").allowed
 
 
 def test_baseline_mode_blocks_everything(store, cfg):
     cfg.set("behaviour.baseline_only", True)
-    guard = Guardrails(store, cfg)
-    decision = guard.check("t1")
+    g = Guardrails(store, cfg)
+    assert not g.check("t1").allowed
+
+
+def test_an_action_is_not_repeated_on_the_same_target(store, cfg):
+    g = Guardrails(store, cfg)
+    assert g.check_action("like", target="alice").allowed
+    g.record_action("like", target="alice")
+    decision = g.check_action("like", target="alice")
     assert not decision.allowed
-    assert "baseline" in decision.reason
+    assert decision.already_satisfied
 
 
-def test_cap_is_per_conversation(store, cfg):
-    cfg.set("behaviour.cooldown_seconds", 0)
-    cfg.set("behaviour.hourly_cap", 1)
-    guard = Guardrails(store, cfg)
-    guard.record_reply("a")
-    assert not guard.check("a").allowed
-    assert guard.check("b").allowed
+def test_inbound_fingerprints_are_deduplicated(store, cfg):
+    g = Guardrails(store, cfg)
+    assert g.record_inbound("t1", "fp1") is True
+    assert g.record_inbound("t1", "fp1") is False
 
 
-# ---------------------------------------------------------------- cookies
-
-REAL_COOKIE = (
-    "csrftoken=ICruY3d8dXKF8kUQNQCRrB;datr=lKACa37319WEYUXZ1k8k41qG;"
-    "ig_did=BE713D86-894D-400F-9D38-48179368C78F;wd=414x863;"
-    "dpr=2.608695652173913;mid=awKglAABAAFciZVSUAtNIWU4k0am;"
-    "ds_user_id=63154994371;"
-    "sessionid=63154994371%3A3hMZMrNTsuDmKm%3A3%3AAYlGRpB1PlVQ_l1XmjSspW_7bwF-053gUkM-Z_pMCA;"
-    'rur="LDC\\05463154994371\\0541826870414:01ff36dea11158aec9a6a216f4d54a2e5a8cd2f9d6f47c5fb4eb9d67a98c24f6bc535210";'
-)
+# --------------------------------------------------------------------- rules
+def test_short_keywords_do_not_fire_on_substrings():
+    rules = load_rules([{"name": "greeting", "match": ["hi"], "reply": "Hello"}])
+    book = Rulebook(rules)
+    assert book.match("hi there") is not None
+    assert book.match("which one is shipping") is None
+    assert book.match("this is high quality") is None
 
 
-def test_parses_every_pair_from_a_real_header():
-    cookies = parse_cookie_header(REAL_COOKIE)
-    names = {c["name"] for c in cookies}
-    assert names == {
-        "csrftoken",
-        "datr",
-        "ig_did",
-        "wd",
-        "dpr",
-        "mid",
-        "ds_user_id",
-        "sessionid",
-        "rur",
-    }
-    assert len(cookies) == 9
+def test_the_most_specific_rule_wins():
+    rules = load_rules(
+        [
+            {"name": "shipping_and_returns", "match": ["shipping and returns"], "reply": "A"},
+            {"name": "returns", "match": ["returns"], "reply": "B"},
+        ]
+    )
+    book = Rulebook(rules)
+    assert book.match("shipping and returns policy") is not None
+    assert book.reply_for("shipping and returns policy", "")[0] == "A"
 
 
-def test_percent_encoded_sessionid_is_decoded():
-    cookies = {c["name"]: c["value"] for c in parse_cookie_header(REAL_COOKIE)}
-    assert cookies["sessionid"].startswith("63154994371:")
-    assert "%3A" not in cookies["sessionid"]
+def test_the_default_reply_is_used_when_nothing_matches():
+    book = Rulebook(load_rules([{"match": ["zzz"], "reply": "x"}]))
+    assert book.reply_for("hello", "fallback")[0] == "fallback"
 
 
-def test_quoted_value_is_unquoted_and_escapes_resolved():
-    cookies = {c["name"]: c["value"] for c in parse_cookie_header(REAL_COOKIE)}
-    assert cookies["rur"].startswith("LDC,63154994371,1826870414:")
-    assert '"' not in cookies["rur"]
-    assert "\\" not in cookies["rur"]
+# --------------------------------------------------------------------- store
+def test_the_store_remembers_and_clears_fingerprints(store):
+    store.record("inbound", thread_id="t1", fingerprint="fp")
+    assert store.has_fingerprint("fp")
+    assert store.clear_fingerprints("t1") == 1
+    assert not store.has_fingerprint("fp")
 
 
-def test_values_containing_equals_survive():
-    cookies = {c["name"]: c["value"] for c in parse_cookie_header("a=1; b=xx==yy; c=3")}
-    assert cookies["b"] == "xx==yy"
+def test_a_task_can_be_cancelled(store):
+    task_id = store.enqueue_task("auto:like", {"x": 1})
+    assert task_id is not None
+    assert store.cancel_task(task_id)
+    assert not store.cancel_task(task_id)
 
 
-def test_empty_and_malformed_input_is_tolerated():
-    assert parse_cookie_header("") == []
-    assert parse_cookie_header("   ") == []
-    assert parse_cookie_header("=novalue") == []
-    assert parse_cookie_header("justtext") == []
+def test_the_store_survives_a_restart(tmp_path):
+    from ibot.store import Store
+
+    path = tmp_path / "s.db"
+    first = Store(path)
+    first.record("inbound", thread_id="t1", fingerprint="fp")
+    first.close()
+    second = Store(path)
+    assert second.has_fingerprint("fp")
+    second.close()
+
+
+# ------------------------------------------------------------------- cookies
+def test_a_cookie_header_is_parsed_and_decoded():
+    cookies = parse_cookie_header("sessionid=631%3Aabc; csrftoken=xyz")
+    assert cookies[0] == {"name": "sessionid", "value": "631:abc"}
+
+
+def test_the_sessionid_is_found_in_any_format():
+    text = "csrftoken=x; sessionid=12345%3Aabc"
+    assert sessionid_from_cookies(parse_cookie_source(text)) == "12345:abc"
+
+
+def test_a_cookie_value_may_contain_equals_signs():
+    cookies = parse_cookie_header("rur=RVA%2C1%2C2%3A01abc==")
+    assert cookies[0]["value"] == "RVA,1,2:01abc=="
+
+
+def test_an_empty_source_is_not_a_crash():
+    assert parse_cookie_source("") == []

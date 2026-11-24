@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
@@ -334,22 +335,129 @@ class ApiClient(BaseClient):
             return False
 
     # ------------------------------------------------------------- content
+    def _story_from_raw(self, s, uid: str = "", username: str = "") -> Story:
+        media_type = int(getattr(s, "media_type", 1) or 1)
+        return Story(
+            pk=str(getattr(s, "pk", "") or getattr(s, "id", "") or ""),
+            user_id=str(uid or getattr(getattr(s, "user", None), "pk", "") or ""),
+            username=username or str(getattr(getattr(s, "user", None), "username", "") or ""),
+            taken_at=self._epoch(getattr(s, "taken_at", None)),
+            media_type=media_type,
+            item_type="video" if media_type == 2 else "photo",
+        )
+
+    def stories_by_id(self, user_id: str, username: str = "") -> list[Story]:
+        """Stories for a known numeric id — no usernameinfo lookup."""
+        uid = str(user_id or "").strip()
+        if not uid:
+            return []
+        try:
+            raw = self._call(self.cl.user_stories, uid) or []
+        except InstagramError:
+            return []
+        return [self._story_from_raw(s, uid=uid, username=username) for s in raw]
+
     def stories(self, username: str) -> list[Story]:
+        """Stories by username (does one id lookup). Prefer stories_by_id when pk is known."""
         uid = self.user_id(username)
-        raw = self._call(self.cl.user_stories, uid) or []
-        out = []
-        for s in raw:
-            out.append(
-                Story(
-                    pk=str(getattr(s, "pk", "") or ""),
-                    user_id=uid,
-                    username=username,
-                    taken_at=self._epoch(getattr(s, "taken_at", None)),
-                    media_type=int(getattr(s, "media_type", 1) or 1),
-                    item_type="video" if int(getattr(s, "media_type", 1) or 1) == 2 else "photo",
-                )
-            )
-        return out
+        return self.stories_by_id(uid, username=username)
+
+    def stories_tray(self) -> dict[str, list[Story]]:
+        """Light path: one request for everyone who currently has a story.
+
+        Uses feed/reels_tray/ — the same endpoint the official app uses.
+        Returns {username: [Story, ...]} for accounts that actually have stories.
+        """
+        found: dict[str, list[Story]] = {}
+        try:
+            # instagrapi sometimes exposes this; otherwise hit private API directly
+            raw = None
+            if hasattr(self.cl, "reels_tray"):
+                raw = self._call(self.cl.reels_tray)
+            elif hasattr(self.cl, "private_request"):
+                raw = self._call(self.cl.private_request, "feed/reels_tray/")
+            if not raw:
+                return found
+            tray = raw.get("tray") if isinstance(raw, dict) else getattr(raw, "tray", None)
+            if not tray:
+                return found
+            for item in tray:
+                user = item.get("user") if isinstance(item, dict) else getattr(item, "user", None)
+                if not user:
+                    continue
+                if isinstance(user, dict):
+                    uname = str(user.get("username") or "")
+                    uid = str(user.get("pk") or user.get("id") or "")
+                else:
+                    uname = str(getattr(user, "username", "") or "")
+                    uid = str(getattr(user, "pk", "") or "")
+                items = item.get("items") if isinstance(item, dict) else getattr(item, "items", None)
+                if not items:
+                    # tray often only lists who has stories; fetch items by id (still 1 call/user with stories)
+                    continue
+                stories = [self._story_from_raw(s, uid=uid, username=uname) for s in items]
+                if stories and uname:
+                    found[uname] = stories
+            return found
+        except InstagramError as exc:
+            log.debug("reels_tray failed: %s", exc)
+            return found
+
+    def stories_for_ids(self, people: list[tuple[str, str]]) -> dict[str, list[Story]]:
+        """Fetch stories for many (user_id, username) pairs — light batch path.
+
+        Prefer GraphQL batch (up to 25 ids) when available, else per-id user_stories
+        with low concurrency. Never does usernameinfo lookups.
+        """
+        found: dict[str, list[Story]] = {}
+        if not people:
+            return found
+
+        # Try GraphQL batch: users_stories_gql(user_ids) — batches of 25
+        gql = getattr(self.cl, "users_stories_gql", None)
+        if callable(gql):
+            ids = []
+            id_to_name: dict[str, str] = {}
+            for uid, uname in people:
+                uid = str(uid or "").strip()
+                if not uid:
+                    continue
+                ids.append(int(uid) if uid.isdigit() else uid)
+                id_to_name[str(uid)] = uname
+            for i in range(0, len(ids), 25):
+                batch = ids[i : i + 25]
+                try:
+                    users = self._call(gql, batch) or []
+                except InstagramError as exc:
+                    log.debug("users_stories_gql batch failed: %s", exc)
+                    continue
+                for u in users:
+                    uname = str(getattr(u, "username", "") or id_to_name.get(str(getattr(u, "pk", "")), ""))
+                    stories_raw = getattr(u, "stories", None) or []
+                    if not stories_raw:
+                        continue
+                    uid = str(getattr(u, "pk", "") or "")
+                    found[uname or uid] = [
+                        self._story_from_raw(s, uid=uid, username=uname) for s in stories_raw
+                    ]
+            if found:
+                return found
+
+        # Fallback: per-id, modest concurrency, no username lookup
+        def one(pair):
+            uid, uname = pair
+            try:
+                stories = self.stories_by_id(uid, username=uname)
+                return uname or uid, stories
+            except Exception:
+                return uname or uid, []
+
+        workers = min(8, max(1, len(people)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for uname, stories in pool.map(one, people):
+                if stories:
+                    found[uname] = stories
+        return found
 
     def view_stories(self, story_pks: list[str]) -> bool:
         if not story_pks:
@@ -363,6 +471,7 @@ class ApiClient(BaseClient):
         if not pks:
             return False
         try:
+            # story_seen accepts a list — one request for many stories
             self._call(self.cl.story_seen, pks)
             return True
         except InstagramError:
